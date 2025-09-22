@@ -30,10 +30,6 @@ impl Uuid {
         Self(ObjectId::new())
     }
 
-    pub fn to_string(&self) -> String {
-        self.0.to_hex()
-    }
-
     pub fn from_string(s: &str) -> Option<Self> {
         ObjectId::from_str(s).map(Self).ok()
     }
@@ -61,8 +57,8 @@ impl From<Uuid> for ObjectId {
     }
 }
 
-impl Into<bson::Bson> for Uuid {
-    fn into(self) -> bson::Bson {
-        bson::Bson::ObjectId(self.0)
+impl From<Uuid> for bson::Bson {
+    fn from(uuid: Uuid) -> Self {
+        bson::Bson::ObjectId(uuid.0)
     }
 }

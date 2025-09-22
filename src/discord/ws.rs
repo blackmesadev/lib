@@ -1,4 +1,11 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use crate::discord::{
     error::{DiscordError, DiscordResult},
@@ -6,17 +13,42 @@ use crate::discord::{
     Message as DiscordMessage,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::Serialize;
 use tokio::{
     net::TcpStream,
     time::{sleep, timeout, Interval},
 };
-use tokio::{sync::RwLock, time::Duration};
+use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use super::{DiscordRestClient, Guild, GuildMemberUpdate, Hello, Intents, Ready, ShardConfig};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+// Discord Gateway opcodes
+const OPCODE_DISPATCH: u8 = 0;
+const OPCODE_HEARTBEAT: u8 = 1;
+const OPCODE_IDENTIFY: u8 = 2;
+const OPCODE_RESUME: u8 = 6;
+const OPCODE_RECONNECT: u8 = 7;
+const OPCODE_INVALID_SESSION: u8 = 9;
+const OPCODE_HELLO: u8 = 10;
+const OPCODE_HEARTBEAT_ACK: u8 = 11;
+
+// Event type constants
+const EVENT_READY: &str = "READY";
+const EVENT_GUILD_CREATE: &str = "GUILD_CREATE";
+const EVENT_GUILD_UPDATE: &str = "GUILD_UPDATE";
+const EVENT_GUILD_MEMBER_UPDATE: &str = "GUILD_MEMBER_UPDATE";
+const EVENT_MESSAGE_CREATE: &str = "MESSAGE_CREATE";
+const EVENT_MESSAGE_UPDATE: &str = "MESSAGE_UPDATE";
+
+#[derive(serde::Deserialize)]
+struct PayloadEnvelope {
+    op: u8,
+    s: Option<u64>,
+    t: Option<String>,
+}
 
 pub enum Event {
     Ready(Ready),
@@ -34,9 +66,10 @@ pub struct DiscordWebsocket {
     sequence: u64,
     shard_config: ShardConfig,
     session_id: Option<String>,
-    heartbeat_ack_received: bool,
+    heartbeat_ack_received: Arc<AtomicBool>,
     last_heartbeat: Option<Instant>,
-    ping: Arc<RwLock<Duration>>,
+    ping_nanos: Arc<AtomicU64>,
+    json_buffer: String,
 }
 
 impl DiscordWebsocket {
@@ -44,7 +77,7 @@ impl DiscordWebsocket {
         rest: Arc<DiscordRestClient>,
         token: Cow<'static, str>,
         shard_config: ShardConfig,
-        ping: Arc<RwLock<Duration>>,
+        ping_nanos: Arc<AtomicU64>,
     ) -> DiscordResult<Self> {
         tracing::info!(shard = ?shard_config.shard_id, "Starting WebSocket connection");
 
@@ -60,16 +93,16 @@ impl DiscordWebsocket {
             sequence: 0,
             shard_config,
             session_id: None,
-            heartbeat_ack_received: true,
+            heartbeat_ack_received: Arc::new(AtomicBool::new(true)),
             last_heartbeat: None,
-            ping,
+            ping_nanos,
+            json_buffer: String::with_capacity(1024),
         };
 
         Ok(discord)
     }
 
     pub async fn handle_initial_connection(&mut self) -> DiscordResult<()> {
-        tracing::debug!("Receiving initial hello payload");
         let hello: Payload<Hello> = {
             let msg = self
                 .socket
@@ -109,7 +142,7 @@ impl DiscordWebsocket {
     pub async fn next_event(&mut self) -> DiscordResult<Option<Event>> {
         loop {
             if let Some(last_heartbeat) = self.last_heartbeat {
-                if !self.heartbeat_ack_received
+                if !self.heartbeat_ack_received.load(Ordering::Relaxed)
                     && last_heartbeat.elapsed() > Duration::from_secs(10)
                 {
                     return Err(DiscordError::NotConnected);
@@ -118,10 +151,10 @@ impl DiscordWebsocket {
 
             tokio::select! {
                 _ = self.heartbeat_interval.tick() => {
-                    if !self.heartbeat_ack_received {
+                    if !self.heartbeat_ack_received.load(Ordering::Relaxed) {
                         return Err(DiscordError::NotConnected);
                     }
-                    self.heartbeat_ack_received = false;
+                    self.heartbeat_ack_received.store(false, Ordering::Relaxed);
                     self.send_heartbeat().await?;
                     self.last_heartbeat = Some(Instant::now());
                 },
@@ -142,88 +175,102 @@ impl DiscordWebsocket {
     }
 
     async fn handle_message(&mut self, msg: Message) -> DiscordResult<Option<Event>> {
-        tracing::debug!("Received WebSocket message");
-
         let text = match msg {
             Message::Text(text) => text,
-            other => {
-                tracing::debug!(message_type = ?other, "Ignoring non-text message");
-                return Ok(None);
-            }
+            _ => return Ok(None),
         };
 
-        let payload: Payload<serde_json::Value> = serde_json::from_str(&text)?;
+        let envelope: PayloadEnvelope = match serde_json::from_str(&text) {
+            Ok(envelope) => envelope,
+            Err(_) => return Ok(None),
+        };
 
-        match payload.op {
-            0 => {
-                if let Some(seq) = payload.s {
+        match envelope.op {
+            OPCODE_DISPATCH => {
+                if let Some(seq) = envelope.s {
                     self.sequence = seq;
                 }
 
-                match payload.t.as_deref() {
-                    Some("READY") => {
-                        if let Some(d) = payload.d {
-                            let ready: Ready = serde_json::from_value(d)?;
-                            self.session_id = ready.session_id.clone();
-                            return Ok(Some(Event::Ready(ready)));
+                match envelope.t.as_deref() {
+                    Some(EVENT_READY) => {
+                        if let Ok(payload) = serde_json::from_str::<Payload<Ready>>(&text) {
+                            if let Some(ready) = payload.d {
+                                self.session_id = ready.session_id.clone();
+                                return Ok(Some(Event::Ready(ready)));
+                            }
                         }
                     }
-                    Some("GUILD_CREATE") => {
-                        if let Some(d) = payload.d {
-                            let guild = serde_json::from_value(d)?;
-                            return Ok(Some(Event::GuildCreate(guild)));
+                    Some(EVENT_GUILD_CREATE) => {
+                        if let Ok(payload) = serde_json::from_str::<Payload<Guild>>(&text) {
+                            if let Some(guild) = payload.d {
+                                return Ok(Some(Event::GuildCreate(guild)));
+                            }
                         }
                     }
-                    Some("GUILD_UPDATE") => {
-                        if let Some(d) = payload.d {
-                            let guild_update = serde_json::from_value(d)?;
-                            return Ok(Some(Event::GuildUpdate(guild_update)));
+                    Some(EVENT_GUILD_UPDATE) => {
+                        if let Ok(payload) = serde_json::from_str::<Payload<Guild>>(&text) {
+                            if let Some(guild) = payload.d {
+                                return Ok(Some(Event::GuildUpdate(guild)));
+                            }
                         }
                     }
-                    Some("GUILD_MEMBER_UPDATE") => {
-                        if let Some(d) = payload.d {
-                            let member_update = serde_json::from_value(d)?;
-                            return Ok(Some(Event::GuildMemberUpdate(member_update)));
+                    Some(EVENT_GUILD_MEMBER_UPDATE) => {
+                        if let Ok(payload) = serde_json::from_str::<Payload<GuildMemberUpdate>>(&text) {
+                            if let Some(member_update) = payload.d {
+                                return Ok(Some(Event::GuildMemberUpdate(member_update)));
+                            }
                         }
                     }
-                    Some("MESSAGE_CREATE") => {
-                        if let Some(d) = payload.d {
-                            let message = serde_json::from_value(d)?;
-                            return Ok(Some(Event::MessageCreate(message)));
+                    Some(EVENT_MESSAGE_CREATE) => {
+                        if let Ok(payload) = serde_json::from_str::<Payload<DiscordMessage>>(&text) {
+                            if let Some(message) = payload.d {
+                                return Ok(Some(Event::MessageCreate(message)));
+                            }
                         }
                     }
-                    _ => (),
+                    Some(EVENT_MESSAGE_UPDATE) => {
+                        if let Ok(payload) = serde_json::from_str::<Payload<DiscordMessage>>(&text) {
+                            if let Some(message) = payload.d {
+                                return Ok(Some(Event::MessageUpdate(message)));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            11 => {
-                self.heartbeat_ack_received = true;
+            OPCODE_HEARTBEAT_ACK => {
+                self.heartbeat_ack_received.store(true, Ordering::Relaxed);
                 if let Some(last_hb) = self.last_heartbeat {
-                    let ping = last_hb.elapsed();
-                    *self.ping.write().await = ping;
+                    let ping_nanos = last_hb.elapsed().as_nanos() as u64;
+                    self.ping_nanos.store(ping_nanos, Ordering::Relaxed);
                 }
             }
-            7 => {
+            OPCODE_RECONNECT => {
                 return Err(DiscordError::NotConnected);
             }
-            9 => {
+            OPCODE_INVALID_SESSION => {
                 self.session_id = None;
                 sleep(Duration::from_secs(5)).await;
                 return Err(DiscordError::NotConnected);
             }
-            _ => (),
+            _ => {}
         }
 
         Ok(None)
     }
 
-    pub async fn send_payload<T: DeserializeOwned + Serialize>(
+    pub async fn send_payload<T: Serialize>(
         &mut self,
-        payload: Payload<T>,
+        payload: &Payload<T>,
     ) -> DiscordResult<()> {
-        let payload = serde_json::to_string(&payload).map_err(|e| DiscordError::Json(e))?;
+        self.json_buffer.clear();
+
+        let json_str = serde_json::to_string(payload).map_err(|e| DiscordError::Json(e))?;
+
+        let msg = Message::text(json_str);
 
         self.socket
-            .send(Message::Text(payload))
+            .send(msg)
             .await
             .map_err(|e| DiscordError::WebSocket(e))?;
 
@@ -231,13 +278,13 @@ impl DiscordWebsocket {
     }
 
     pub async fn send_heartbeat(&mut self) -> DiscordResult<()> {
-        self.send_payload(Payload {
-            op: 1,
+        let payload = Payload {
+            op: OPCODE_HEARTBEAT,
             d: Some(self.sequence),
             s: None,
             t: None,
-        })
-        .await
+        };
+        self.send_payload(&payload).await
     }
 
     async fn identify(&mut self) -> DiscordResult<()> {
@@ -248,13 +295,13 @@ impl DiscordWebsocket {
             shard: self.shard_config.to_array(),
         };
 
-        self.send_payload(Payload {
-            op: 2,
+        let payload = Payload {
+            op: OPCODE_IDENTIFY,
             d: Some(identify),
             s: None,
             t: None,
-        })
-        .await
+        };
+        self.send_payload(&payload).await
     }
 
     async fn resume(&mut self, session_id: String) -> DiscordResult<()> {
@@ -264,26 +311,36 @@ impl DiscordWebsocket {
             "seq": self.sequence
         });
 
-        self.send_payload(Payload {
-            op: 6,
+        let payload = Payload {
+            op: OPCODE_RESUME,
             d: Some(resume),
             s: None,
             t: None,
-        })
-        .await
+        };
+        self.send_payload(&payload).await
     }
 
     async fn set_speaking(&mut self, speaking: bool) -> DiscordResult<()> {
-        self.send_payload(Payload {
+        let speaking_data = serde_json::json!({
+            "speaking": speaking,
+            "delay": 0,
+            "ssrc": 1
+        });
+
+        let payload = Payload {
             op: 5,
-            d: Some(serde_json::json!({
-                "speaking": speaking,
-                "delay": 0,
-                "ssrc": 1
-            })),
+            d: Some(speaking_data),
             s: None,
             t: None,
-        })
-        .await
+        };
+        self.send_payload(&payload).await
+    }
+
+    pub fn ping(&self) -> Duration {
+        Duration::from_nanos(self.ping_nanos.load(Ordering::Relaxed))
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.heartbeat_ack_received.load(Ordering::Relaxed)
     }
 }

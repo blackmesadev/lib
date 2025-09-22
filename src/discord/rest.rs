@@ -81,12 +81,12 @@ impl DiscordRestClient {
         path: &str,
         data: Option<T>,
         headers: Option<HeaderMap>,
-        bucket: &str,
+        endpoint: &str,
     ) -> DiscordResult<Response>
     where
         T: Serialize,
     {
-        tracing::debug!(bucket = bucket, "Making API request");
+        tracing::debug!(endpoint = endpoint, "Making API request");
 
         loop {
             if let Some((reset_time, wait)) = *self.global_rate_limit.read().await {
@@ -96,19 +96,21 @@ impl DiscordRestClient {
                 }
             }
 
-            if let Some(rate_limit) = self.rate_limits.get(bucket) {
+            if let Some(rate_limit) = self.rate_limits.get(endpoint) {
                 if let Some(wait_time) = rate_limit.should_wait() {
                     tracing::warn!(
-                        bucket = bucket,
+                        endpoint = endpoint,
                         wait_ms = wait_time.as_millis(),
-                        "Waiting for bucket rate limit"
+                        "Waiting for endpoint rate limit"
                     );
                     sleep(wait_time).await;
                 }
             }
 
-            let auth_header = format!("{}{}", AUTH_PREFIX, self.token.as_ref());
+            let auth_header = format!("{}{}", AUTH_PREFIX, self.token.as_ref().trim());
             let url = format!("{}{}", API_BASE, path);
+
+            tracing::debug!(url = url, "Sending API request");
 
             let request = match method {
                 Method::GET => self.client.get(&url),
@@ -133,7 +135,7 @@ impl DiscordRestClient {
                 _ => self.client.get(&url),
             };
 
-            let mut req = request.header("Authorization", auth_header);
+            let mut req = request.header("Authorization", &auth_header);
 
             if let Some(ref headers) = headers {
                 for (key, value) in headers.iter() {
@@ -141,20 +143,26 @@ impl DiscordRestClient {
                 }
             }
 
+            tracing::debug!(request = ?req, "Prepared API request");
+
             let response = req.send().await.map_err(|e| {
                 tracing::error!(error = %e, "Discord API request failed");
                 e
             })?;
 
             if response.status() == 429 {
-                tracing::warn!(bucket = bucket, status = 429, "Rate limited by Discord API");
+                tracing::warn!(
+                    endpoint = endpoint,
+                    status = 429,
+                    "Rate limited by Discord API"
+                );
                 if let Some(rate_limit) = RateLimit::from_headers(response.headers()) {
                     if rate_limit.is_global {
                         let wait_time = Duration::from_secs_f64(rate_limit.reset_after);
                         *self.global_rate_limit.write().await =
-                            Some((Instant::now() + wait_time, wait_time)); // Changed to .await
+                            Some((Instant::now() + wait_time, wait_time));
                     } else {
-                        self.rate_limits.insert(bucket.to_string(), rate_limit);
+                        self.rate_limits.insert(endpoint.to_string(), rate_limit);
                     }
                 }
                 continue;
@@ -163,7 +171,7 @@ impl DiscordRestClient {
             if !response.status().is_success() {
                 tracing::error!(
                     status = response.status().as_u16(),
-                    bucket = bucket,
+                    endpoint = endpoint,
                     "Discord API request failed"
                 );
                 return Err(response.error_for_status().unwrap_err().into());
@@ -171,14 +179,14 @@ impl DiscordRestClient {
 
             tracing::debug!(
                 status = response.status().as_u16(),
-                bucket = bucket,
+                endpoint = endpoint,
                 "Discord API request successful"
             );
 
             let rate_limit = RateLimit::from_headers(response.headers());
 
             if let Some(rate_limit) = rate_limit {
-                self.rate_limits.insert(bucket.to_string(), rate_limit);
+                self.rate_limits.insert(endpoint.to_string(), rate_limit);
             }
 
             return Ok(response);
