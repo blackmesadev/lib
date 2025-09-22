@@ -28,7 +28,7 @@ impl Id {
 
     pub fn from_str(s: &str) -> Result<Self, ParseIntError> {
         s.trim_matches(|c| c == '<' || c == '>')
-            .trim_start_matches(|c| c == '#' || c == '@' || c == '!' || c == '&')
+            .trim_start_matches(['#', '@', '!', '&'])
             .parse()
             .map(Self)
     }
@@ -149,6 +149,12 @@ pub struct ConnectionProperties {
     pub browser: SmolStr,
     #[serde(rename = "$device")]
     pub device: SmolStr,
+}
+
+impl Default for ConnectionProperties {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConnectionProperties {
@@ -279,7 +285,7 @@ impl Embed {
             && self.video.is_none()
             && self.provider.is_none()
             && self.author.is_none()
-            && self.fields.as_ref().map_or(true, |f| f.is_empty())
+            && self.fields.as_ref().is_none_or(|f| f.is_empty())
     }
 }
 
@@ -547,7 +553,7 @@ impl<'de> Deserialize<'de> for Intents {
         D: serde::Deserializer<'de>,
     {
         let bits = u64::deserialize(deserializer)?;
-        Ok(Intents::from_bits(bits).unwrap_or_else(|| Intents::NONE))
+        Ok(Intents::from_bits(bits).unwrap_or(Intents::NONE))
     }
 }
 

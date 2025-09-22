@@ -95,7 +95,7 @@ pub struct Args<'a>(&'a [Arg], &'a [&'a str]);
 
 impl Args<'_> {
     pub fn new<'a>(args: &'a [Arg], msg: &'a [&'a str]) -> Args<'a> {
-        Args(args, &msg)
+        Args(args, msg)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Arg> {
@@ -127,7 +127,7 @@ impl Args<'_> {
     }
 
     pub fn get_subcommand(&self) -> Option<&str> {
-        self.0.get(0).and_then(|arg| arg.as_text())
+        self.0.first().and_then(|arg| arg.as_text())
     }
 
     pub fn pop_subcommand(&mut self) -> Option<&str> {
@@ -243,7 +243,7 @@ pub async fn parse_args(mut args: impl Iterator<Item = &'_ str>) -> Vec<Arg> {
 
     let max_snowflake = util::max_snowflake_now();
 
-    while let Some(arg) = args.next() {
+    for arg in args.by_ref() {
         if text_mode {
             text_buffer.push(arg);
             continue;

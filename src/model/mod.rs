@@ -25,6 +25,12 @@ impl UnixTimestamp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Uuid(ObjectId);
 
+impl Default for Uuid {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Uuid {
     pub fn new() -> Self {
         Self(ObjectId::new())

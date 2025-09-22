@@ -84,7 +84,7 @@ impl DiscordWebsocket {
         let gateway = rest.get_gateway().await?;
         let (socket, _) = connect_async(&gateway.url)
             .await
-            .map_err(|e| DiscordError::WebSocket(e))?;
+            .map_err(DiscordError::WebSocket)?;
 
         let discord = DiscordWebsocket {
             token: token.clone(),
@@ -109,8 +109,8 @@ impl DiscordWebsocket {
                 .next()
                 .await
                 .ok_or_else(|| DiscordError::NotConnected)?
-                .map_err(|e| DiscordError::WebSocket(e))?;
-            let text = msg.into_text().map_err(|e| DiscordError::WebSocket(e))?;
+                .map_err(DiscordError::WebSocket)?;
+            let text = msg.into_text().map_err(DiscordError::WebSocket)?;
             serde_json::from_str(&text)?
         };
 
@@ -128,7 +128,7 @@ impl DiscordWebsocket {
             .next()
             .await
             .ok_or_else(|| DiscordError::NotConnected)?
-            .map_err(|e| DiscordError::WebSocket(e))?;
+            .map_err(DiscordError::WebSocket)?;
 
         if let Some(session_id) = &self.session_id {
             self.resume(session_id.clone()).await?;
@@ -265,14 +265,14 @@ impl DiscordWebsocket {
     ) -> DiscordResult<()> {
         self.json_buffer.clear();
 
-        let json_str = serde_json::to_string(payload).map_err(|e| DiscordError::Json(e))?;
+        let json_str = serde_json::to_string(payload).map_err(DiscordError::Json)?;
 
         let msg = Message::text(json_str);
 
         self.socket
             .send(msg)
             .await
-            .map_err(|e| DiscordError::WebSocket(e))?;
+            .map_err(DiscordError::WebSocket)?;
 
         Ok(())
     }

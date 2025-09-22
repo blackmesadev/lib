@@ -360,7 +360,7 @@ impl DiscordRestClient {
         let channel_id = channel_id.clone();
         tokio::spawn(async move {
             if let Err(e) = client
-                .post(&format!("{}/channels/{}/messages", API_BASE, channel_id))
+                .post(format!("{}/channels/{}/messages", API_BASE, channel_id))
                 .header("Authorization", format!("{}{}", AUTH_PREFIX, token))
                 .json(&data)
                 .send()
@@ -396,7 +396,7 @@ impl DiscordRestClient {
         let channel_id = channel_id.clone();
         tokio::spawn(async move {
             if let Err(e) = client
-                .post(&format!("{}/channels/{}/messages", API_BASE, channel_id))
+                .post(format!("{}/channels/{}/messages", API_BASE, channel_id))
                 .header("Authorization", format!("{}{}", AUTH_PREFIX, token))
                 .json(&data)
                 .send()
@@ -422,9 +422,9 @@ impl DiscordRestClient {
         let channel_id = channel["id"]
             .as_str()
             .ok_or(DiscordError::KeyNotFound("Channel ID not found".into()))?;
-        Ok(channel_id
+        channel_id
             .parse()
-            .map_err(|_| DiscordError::ParseError("Channel ID".into()))?)
+            .map_err(|_| DiscordError::ParseError("Channel ID".into()))
     }
 
     pub async fn kick_member(
@@ -565,7 +565,7 @@ impl DiscordRestClient {
         let message_id = message_id.clone();
         tokio::spawn(async move {
             if let Err(e) = client
-                .delete(&format!(
+                .delete(format!(
                     "{}/channels/{}/messages/{}",
                     API_BASE, channel_id, message_id
                 ))
