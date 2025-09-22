@@ -39,10 +39,7 @@ impl CacheBackend for RedisCache {
     {
         let start = std::time::Instant::now();
         let value = match serde_json::to_string(value) {
-            Ok(v) => {
-                tracing::debug!(value_size = v.len(), "Serializing value");
-                v
-            }
+            Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = ?e, "Failed to serialize value");
                 return Err(e.into());
@@ -65,15 +62,9 @@ impl CacheBackend for RedisCache {
         };
 
         match result {
-            Ok(_) => {
-                tracing::debug!(
-                    duration_ms = start.elapsed().as_millis(),
-                    "Operation successful"
-                );
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(e) => {
-                tracing::error!(error = ?e, "Operation failed");
+                tracing::error!(error = ?e, duration_ms = start.elapsed().as_millis(), "Redis operation failed");
                 Err(e.into())
             }
         }
@@ -92,18 +83,8 @@ impl CacheBackend for RedisCache {
             .await?;
 
         match result {
-            Some(v) => {
-                tracing::debug!(
-                    duration_ms = start.elapsed().as_millis(),
-                    value_size = v.len(),
-                    "Cache hit"
-                );
-                Ok(Some(serde_json::from_str(&v)?))
-            }
-            None => {
-                tracing::debug!(duration_ms = start.elapsed().as_millis(), "Cache miss");
-                Ok(None)
-            }
+            Some(v) => Ok(Some(serde_json::from_str(&v)?)),
+            None => Ok(None),
         }
     }
 

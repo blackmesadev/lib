@@ -399,10 +399,6 @@ impl PermissionSet {
             }
         });
 
-        tracing::debug!(
-            "Creating permission set from Discord permissions: {:?}",
-            perms
-        );
         let mut set = Self::new();
 
         // Administrator gives all permissions

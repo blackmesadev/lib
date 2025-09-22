@@ -7,8 +7,7 @@ use reqwest::{header::HeaderMap, Client, Method, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    borrow::Cow,
-    time::{Duration, Instant},
+    borrow::Cow, error::Error, time::{Duration, Instant}
 };
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -17,7 +16,6 @@ use tracing::instrument;
 use super::{DiscordError, Embed, Guild, Id, Message};
 
 const API_BASE: &str = "https://discord.com/api/v10";
-const AUTH_PREFIX: &str = "Bot ";
 
 #[derive(Debug, Clone)]
 struct RateLimit {
@@ -65,13 +63,32 @@ pub struct DiscordRestClient {
 }
 
 impl DiscordRestClient {
-    pub fn new(token: Cow<'static, str>) -> Self {
+    pub fn new(token: &str) -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .tls_built_in_root_certs(true)
+            .user_agent(format!(
+                "DiscordBot (github.com/blackmesadev/lib, {})",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .build()
+            .expect("Failed to create HTTP client");
+
+        tracing::info!("Discord REST client initialized");
+
+        let trimmed_token = token.trim().to_string();
+
         Self {
-            client: Client::new(),
-            token,
+            client,
+            token: Cow::Owned(trimmed_token),
             rate_limits: DashMap::new(),
             global_rate_limit: RwLock::new(None),
         }
+    }
+
+    #[inline]
+    fn build_url(&self, path: &str) -> String {
+        format!("{}{}", API_BASE, path)
     }
 
     #[instrument(skip(self, data), fields(method = ?method, path = path))]
@@ -86,8 +103,6 @@ impl DiscordRestClient {
     where
         T: Serialize,
     {
-        tracing::debug!(endpoint = endpoint, "Making API request");
-
         loop {
             if let Some((reset_time, wait)) = *self.global_rate_limit.read().await {
                 if Instant::now() < reset_time {
@@ -107,10 +122,7 @@ impl DiscordRestClient {
                 }
             }
 
-            let auth_header = format!("{}{}", AUTH_PREFIX, self.token.as_ref().trim());
-            let url = format!("{}{}", API_BASE, path);
-
-            tracing::debug!(url = url, "Sending API request");
+            let url = self.build_url(path);
 
             let request = match method {
                 Method::GET => self.client.get(&url),
@@ -135,7 +147,7 @@ impl DiscordRestClient {
                 _ => self.client.get(&url),
             };
 
-            let mut req = request.header("Authorization", &auth_header);
+            let mut req = request.header("Authorization", self.token.as_ref());
 
             if let Some(ref headers) = headers {
                 for (key, value) in headers.iter() {
@@ -143,11 +155,14 @@ impl DiscordRestClient {
                 }
             }
 
-            tracing::debug!(request = ?req, "Prepared API request");
-
             let response = req.send().await.map_err(|e| {
-                tracing::error!(error = %e, "Discord API request failed");
-                e
+                tracing::error!(
+                    error = %e,
+                    url = url,
+                    source = ?e.source(),
+                    "Discord API request failed"
+                );
+                DiscordError::Http(e)
             })?;
 
             if response.status() == 429 {
@@ -177,12 +192,6 @@ impl DiscordRestClient {
                 return Err(response.error_for_status().unwrap_err().into());
             }
 
-            tracing::debug!(
-                status = response.status().as_u16(),
-                endpoint = endpoint,
-                "Discord API request successful"
-            );
-
             let rate_limit = RateLimit::from_headers(response.headers());
 
             if let Some(rate_limit) = rate_limit {
@@ -194,7 +203,6 @@ impl DiscordRestClient {
     }
 
     pub async fn get_gateway(&self) -> DiscordResult<Gateway> {
-        tracing::debug!("Fetching gateway URL");
         let response = self
             .make_request(Method::GET, "/gateway", Option::<()>::None, None, "gateway")
             .await?;
@@ -302,7 +310,6 @@ impl DiscordRestClient {
     }
 
     pub async fn create_message(&self, channel_id: &Id, content: &str) -> DiscordResult<Message> {
-        tracing::debug!(channel_id = %channel_id, "Creating message");
         let data = json!({ "content": content });
         let response = self
             .make_request(
@@ -357,11 +364,11 @@ impl DiscordRestClient {
         let data = json!({ "content": content });
         let client = self.client.clone();
         let token = self.token.clone();
-        let channel_id = channel_id.clone();
+        let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
         tokio::spawn(async move {
             if let Err(e) = client
-                .post(format!("{}/channels/{}/messages", API_BASE, channel_id))
-                .header("Authorization", format!("{}{}", AUTH_PREFIX, token))
+                .post(url)
+                .header("Authorization", token.as_ref())
                 .json(&data)
                 .send()
                 .await
@@ -374,7 +381,7 @@ impl DiscordRestClient {
     pub async fn create_message_with_embed(
         &self,
         channel_id: &Id,
-        embeds: &Vec<Embed>,
+        embeds: &[Embed],
     ) -> DiscordResult<Message> {
         let data = json!({ "embeds": embeds });
         let response = self
@@ -389,15 +396,15 @@ impl DiscordRestClient {
         response.json().await.map_err(Into::into)
     }
 
-    pub async fn create_message_with_embed_and_forget(&self, channel_id: &Id, embeds: &Vec<Embed>) {
+    pub async fn create_message_with_embed_and_forget(&self, channel_id: &Id, embeds: &[Embed]) {
         let data = json!({ "embeds": embeds });
         let client = self.client.clone();
         let token = self.token.clone();
-        let channel_id = channel_id.clone();
+        let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
         tokio::spawn(async move {
             if let Err(e) = client
-                .post(format!("{}/channels/{}/messages", API_BASE, channel_id))
-                .header("Authorization", format!("{}{}", AUTH_PREFIX, token))
+                .post(url)
+                .header("Authorization", token.as_ref())
                 .json(&data)
                 .send()
                 .await
@@ -431,12 +438,16 @@ impl DiscordRestClient {
         &self,
         guild_id: &Id,
         user_id: &Id,
-        reason: Option<Cow<'_, str>>,
+        reason: Option<impl AsRef<str>>,
     ) -> DiscordResult<()> {
-        let headers = reason.map(|r| {
+        let headers = reason.and_then(|r| {
             let mut headers = HeaderMap::new();
-            headers.insert("X-Audit-Log-Reason", r.parse().unwrap());
-            headers
+            if let Ok(header_value) = r.as_ref().parse() {
+                headers.insert("X-Audit-Log-Reason", header_value);
+                Some(headers)
+            } else {
+                None
+            }
         });
 
         self.make_request(
@@ -454,13 +465,17 @@ impl DiscordRestClient {
         &self,
         guild_id: &Id,
         user_id: &Id,
-        reason: Option<Cow<'_, str>>,
+        reason: Option<impl AsRef<str>>,
         delete_message_days: u8,
     ) -> DiscordResult<()> {
-        let headers = reason.map(|r| {
+        let headers = reason.and_then(|r| {
             let mut headers = HeaderMap::new();
-            headers.insert("X-Audit-Log-Reason", r.parse().unwrap());
-            headers
+            if let Ok(header_value) = r.as_ref().parse() {
+                headers.insert("X-Audit-Log-Reason", header_value);
+                Some(headers)
+            } else {
+                None
+            }
         });
 
         let data = json!({ "delete_message_days": delete_message_days });
@@ -479,12 +494,16 @@ impl DiscordRestClient {
         &self,
         guild_id: &Id,
         user_id: &Id,
-        reason: Option<Cow<'_, str>>,
+        reason: Option<impl AsRef<str>>,
     ) -> DiscordResult<()> {
-        let headers = reason.map(|r| {
+        let headers = reason.and_then(|r| {
             let mut headers = HeaderMap::new();
-            headers.insert("X-Audit-Log-Reason", r.parse().unwrap());
-            headers
+            if let Ok(header_value) = r.as_ref().parse() {
+                headers.insert("X-Audit-Log-Reason", header_value);
+                Some(headers)
+            } else {
+                None
+            }
         });
 
         self.make_request(
@@ -503,12 +522,16 @@ impl DiscordRestClient {
         guild_id: &Id,
         user_id: &Id,
         role_id: &Id,
-        reason: Option<Cow<'_, str>>,
+        reason: Option<impl AsRef<str>>,
     ) -> DiscordResult<()> {
-        let headers = reason.map(|r| {
+        let headers = reason.and_then(|r| {
             let mut headers = HeaderMap::new();
-            headers.insert("X-Audit-Log-Reason", r.parse().unwrap());
-            headers
+            if let Ok(header_value) = r.as_ref().parse() {
+                headers.insert("X-Audit-Log-Reason", header_value);
+                Some(headers)
+            } else {
+                None
+            }
         });
 
         self.make_request(
@@ -527,12 +550,16 @@ impl DiscordRestClient {
         guild_id: &Id,
         user_id: &Id,
         role_id: &Id,
-        reason: Option<Cow<'_, str>>,
+        reason: Option<impl AsRef<str>>,
     ) -> DiscordResult<()> {
-        let headers = reason.map(|r| {
+        let headers = reason.and_then(|r| {
             let mut headers = HeaderMap::new();
-            headers.insert("X-Audit-Log-Reason", r.parse().unwrap());
-            headers
+            if let Ok(header_value) = r.as_ref().parse() {
+                headers.insert("X-Audit-Log-Reason", header_value);
+                Some(headers)
+            } else {
+                None
+            }
         });
 
         self.make_request(
@@ -561,15 +588,14 @@ impl DiscordRestClient {
     pub async fn delete_message_and_forget(&self, channel_id: &Id, message_id: &Id) {
         let client = self.client.clone();
         let token = self.token.clone();
-        let channel_id = channel_id.clone();
-        let message_id = message_id.clone();
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            API_BASE, channel_id, message_id
+        );
         tokio::spawn(async move {
             if let Err(e) = client
-                .delete(format!(
-                    "{}/channels/{}/messages/{}",
-                    API_BASE, channel_id, message_id
-                ))
-                .header("Authorization", format!("{}{}", AUTH_PREFIX, token))
+                .delete(url)
+                .header("Authorization", token.as_ref())
                 .send()
                 .await
             {

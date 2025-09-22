@@ -236,7 +236,6 @@ impl<'a> Ctx<'a> {
 
 #[instrument(skip(args))]
 pub async fn parse_args(mut args: impl Iterator<Item = &'_ str>) -> Vec<Arg> {
-    tracing::debug!("Parsing command arguments");
     let mut parsed_args = Vec::new();
     let mut text_buffer = Vec::new();
     let mut text_mode = false;
@@ -276,13 +275,11 @@ pub async fn parse_args(mut args: impl Iterator<Item = &'_ str>) -> Vec<Arg> {
         parsed_args.push(Arg::Text(text_buffer.join(" ")));
     }
 
-    tracing::debug!(arg_count = parsed_args.len(), "Finished parsing arguments");
     parsed_args
 }
 
 #[instrument]
 pub fn parse_mention(arg: &str) -> Option<Arg> {
-    tracing::debug!(arg = arg, "Parsing mention");
     if (!arg.starts_with('<')) || (!arg.ends_with('>')) {
         return None;
     }
@@ -304,7 +301,6 @@ pub fn parse_mention(arg: &str) -> Option<Arg> {
 
 #[instrument]
 pub fn parse_duration(arg: &str) -> Option<u64> {
-    tracing::debug!(arg = arg, "Parsing duration");
     if !arg.chars().any(|c| c.is_ascii_digit()) {
         return None;
     }

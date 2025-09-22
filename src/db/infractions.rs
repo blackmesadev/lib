@@ -110,7 +110,10 @@ impl Database {
     pub async fn deactivate_infraction(&self, id: &Uuid) -> Result<bool, MongoError> {
         let result = self
             .infractions()
-            .update_one(doc! { "_id": id.inner() }, doc! { "$set": { "active": false } })
+            .update_one(
+                doc! { "_id": id.inner() },
+                doc! { "$set": { "active": false } },
+            )
             .await?;
 
         Ok(result.modified_count > 0)

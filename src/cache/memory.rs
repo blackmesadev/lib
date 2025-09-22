@@ -89,12 +89,10 @@ impl CacheBackend for MemoryCache {
 
         let result = match self.get_entry(&key) {
             Some(entry) => {
-                tracing::debug!("Cache hit");
                 let value: V = serde_json::from_slice(&entry.data)?;
                 Ok(Some(value))
             }
             None => {
-                tracing::debug!("Cache miss");
                 Ok(None)
             }
         };
@@ -110,10 +108,7 @@ impl CacheBackend for MemoryCache {
         let key = Self::key_to_string(&key);
 
         let data = match serde_json::to_vec(value) {
-            Ok(d) => {
-                tracing::debug!(value_size = d.len(), "Serializing value");
-                d
-            }
+            Ok(d) => d,
             Err(e) => {
                 tracing::error!(error = ?e, "Failed to serialize value");
                 return Err(e.into());
@@ -130,7 +125,6 @@ impl CacheBackend for MemoryCache {
             },
         );
 
-        tracing::debug!("Operation successful");
         Ok(())
     }
 
@@ -161,8 +155,6 @@ impl CacheBackend for MemoryCache {
                 1
             }
         };
-
-        tracing::debug!("Operation successful");
 
         Ok(value)
     }
@@ -199,8 +191,6 @@ impl CacheBackend for MemoryCache {
                 increment
             }
         };
-
-        tracing::debug!("Operation successful");
 
         Ok(value)
     }
