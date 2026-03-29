@@ -9,6 +9,7 @@ pub enum Permission {
     Moderation,
     Music,
     Config,
+    Infraction,
     Utility,
 
     // Moderation permissions
@@ -36,6 +37,10 @@ pub enum Permission {
     ConfigView,
     ConfigEdit,
 
+    // Infraction permissions
+    InfractionView,
+    InfractionEdit,
+
     // Utility permissions
     UtilityInfo,
     UtilityUserinfo,
@@ -53,6 +58,7 @@ impl Permission {
             "moderation" => Permission::Moderation,
             "music" => Permission::Music,
             "config" => Permission::Config,
+            "infraction" => Permission::Infraction,
             "utility" => Permission::Utility,
             "moderation.kick" => Permission::ModerationKick,
             "moderation.ban" => Permission::ModerationBan,
@@ -73,6 +79,8 @@ impl Permission {
             "music.shuffle" => Permission::MusicShuffle,
             "config.view" => Permission::ConfigView,
             "config.edit" => Permission::ConfigEdit,
+            "infraction.view" => Permission::InfractionView,
+            "infraction.edit" => Permission::InfractionEdit,
             "utility.info" => Permission::UtilityInfo,
             "utility.userinfo" => Permission::UtilityUserinfo,
             "utility.serverinfo" => Permission::UtilityServerinfo,
@@ -112,6 +120,7 @@ impl Permission {
                 MusicShuffle,
             ]),
             Config => HashSet::from([ConfigView, ConfigEdit]),
+            Infraction => HashSet::from([InfractionView, InfractionEdit]),
             Utility => HashSet::from([
                 UtilityInfo,
                 UtilityUserinfo,
@@ -130,13 +139,14 @@ impl Permission {
         use Permission::*;
         match self {
             All => None,
-            Moderation | Music | Config | Utility => Some(All),
+            Moderation | Music | Config | Infraction | Utility => Some(All),
             ModerationKick | ModerationBan | ModerationUnban | ModerationMute
             | ModerationUnmute | ModerationWarn | ModerationPardon | ModerationPurge
             | ModerationLookup => Some(Moderation),
             MusicPlay | MusicSkip | MusicStop | MusicPause | MusicResume | MusicClear
             | MusicVolume | MusicShuffle => Some(Music),
             ConfigView | ConfigEdit => Some(Config),
+            InfractionView | InfractionEdit => Some(Infraction),
             UtilityInfo | UtilityUserinfo | UtilityServerinfo | UtilityHelp | UtilityPing
             | UtilityInvite | UtilitySelfLookup => Some(Utility),
         }
@@ -151,6 +161,7 @@ impl Permission {
             Moderation,
             Music,
             Config,
+            Infraction,
             Utility,
             ModerationKick,
             ModerationBan,
@@ -170,6 +181,8 @@ impl Permission {
             MusicShuffle,
             ConfigView,
             ConfigEdit,
+            InfractionView,
+            InfractionEdit,
             UtilityInfo,
             UtilityUserinfo,
             UtilityServerinfo,
@@ -188,6 +201,7 @@ impl Permission {
             Moderation,
             Music,
             Config,
+            Infraction,
             Utility,
             ModerationKick,
             ModerationBan,
@@ -207,6 +221,8 @@ impl Permission {
             MusicShuffle,
             ConfigView,
             ConfigEdit,
+            InfractionView,
+            InfractionEdit,
             UtilityInfo,
             UtilityUserinfo,
             UtilityServerinfo,
@@ -227,6 +243,7 @@ impl fmt::Display for Permission {
                 Self::Moderation => "moderation",
                 Self::Music => "music",
                 Self::Config => "config",
+                Self::Infraction => "infraction",
                 Self::Utility => "utility",
                 Self::ModerationKick => "moderation.kick",
                 Self::ModerationBan => "moderation.ban",
@@ -247,6 +264,8 @@ impl fmt::Display for Permission {
                 Self::MusicShuffle => "music.shuffle",
                 Self::ConfigView => "config.view",
                 Self::ConfigEdit => "config.edit",
+                Self::InfractionView => "infraction.view",
+                Self::InfractionEdit => "infraction.edit",
                 Self::UtilityInfo => "utility.info",
                 Self::UtilityUserinfo => "utility.userinfo",
                 Self::UtilityServerinfo => "utility.serverinfo",
@@ -273,6 +292,7 @@ impl<'de> Deserialize<'de> for Permission {
             "moderation" => Ok(Self::Moderation),
             "music" => Ok(Self::Music),
             "config" => Ok(Self::Config),
+            "infraction" => Ok(Self::Infraction),
             "utility" => Ok(Self::Utility),
             "moderation.kick" => Ok(Self::ModerationKick),
             "moderation.ban" => Ok(Self::ModerationBan),
@@ -292,6 +312,8 @@ impl<'de> Deserialize<'de> for Permission {
             "music.shuffle" => Ok(Self::MusicShuffle),
             "config.view" => Ok(Self::ConfigView),
             "config.edit" => Ok(Self::ConfigEdit),
+            "infraction.view" => Ok(Self::InfractionView),
+            "infraction.edit" => Ok(Self::InfractionEdit),
             "utility.info" => Ok(Self::UtilityInfo),
             "utility.userinfo" => Ok(Self::UtilityUserinfo),
             "utility.serverinfo" => Ok(Self::UtilityServerinfo),
@@ -449,9 +471,12 @@ impl PermissionSet {
         if perms.contains(Permissions::MANAGE_CHANNELS) {
             set.add(Permission::Config);
             set.add(Permission::ConfigEdit);
+            set.add(Permission::Infraction);
+            set.add(Permission::InfractionEdit);
         }
         if perms.contains(Permissions::VIEW_CHANNEL) {
             set.add(Permission::ConfigView);
+            set.add(Permission::InfractionView);
         }
 
         // Utility Permissions (basic permissions everyone should have)

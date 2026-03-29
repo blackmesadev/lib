@@ -7,6 +7,19 @@ use crate::{discord::Id, model::Config};
 pub use super::DbError;
 
 impl Database {
+    #[instrument(name = "db_list_guild_ids", skip(self))]
+    pub async fn list_guild_ids(&self) -> Result<Vec<Id>, DbError> {
+        let rows = sqlx::query_scalar::<_, i64>(
+            r#"SELECT id
+               FROM configs
+               ORDER BY id"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|id| Id::new(id as u64)).collect())
+    }
+
     #[instrument(
         name = "db_get_config",
         skip(self),
@@ -64,13 +77,13 @@ impl Database {
             guild_id = %config.id
         )
     )]
-    pub async fn update_config(&self, guild_id: &Id, config: &Config) -> Result<(), DbError> {
+    pub async fn update_config(&self, guild_id: &Id, config: &Config) -> Result<Config, DbError> {
         let guild_id_i64 = guild_id.get() as i64;
         let permission_groups = to_json_opt(&config.permission_groups, "permission_groups")?;
         let automod = to_json_opt(&config.automod, "automod")?;
         let command_aliases = to_json_opt(&config.command_aliases, "command_aliases")?;
 
-        sqlx::query(
+        let row = sqlx::query_as::<_, ConfigRow>(
             r#"UPDATE configs
                SET
                    prefix = $2,
@@ -84,7 +97,20 @@ impl Database {
                    permission_groups = $10,
                    automod = $11,
                    command_aliases = $12
-               WHERE id = $1"#,
+               WHERE id = $1
+               RETURNING
+                   id,
+                   prefix,
+                   mute_role,
+                   default_warn_duration,
+                   log_channel,
+                   prefer_embeds,
+                   inherit_discord_perms,
+                   alert_on_infraction,
+                   send_permission_denied,
+                   permission_groups,
+                   automod,
+                   command_aliases"#,
         )
         .bind(guild_id_i64)
         .bind(&config.prefix)
@@ -98,10 +124,23 @@ impl Database {
         .bind(permission_groups)
         .bind(automod)
         .bind(command_aliases)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(Config {
+            id: Id::new(row.id as u64),
+            prefix: row.prefix,
+            mute_role: row.mute_role.map(|v| Id::new(v as u64)),
+            default_warn_duration: row.default_warn_duration.map(|v| v as u64),
+            log_channel: row.log_channel.map(|v| Id::new(v as u64)),
+            prefer_embeds: row.prefer_embeds,
+            inherit_discord_perms: row.inherit_discord_perms,
+            alert_on_infraction: row.alert_on_infraction,
+            send_permission_denied: row.send_permission_denied,
+            permission_groups: parse_json_opt(row.permission_groups, "permission_groups")?,
+            automod: parse_json_opt(row.automod, "automod")?,
+            command_aliases: parse_json_opt(row.command_aliases, "command_aliases")?,
+        })
     }
 
     #[instrument(
@@ -111,13 +150,13 @@ impl Database {
             guild_id = %config.id
         )
     )]
-    pub async fn create_config(&self, config: &Config) -> Result<(), DbError> {
+    pub async fn create_config(&self, config: &Config) -> Result<Config, DbError> {
         let guild_id_i64 = config.id.get() as i64;
         let permission_groups = to_json_opt(&config.permission_groups, "permission_groups")?;
         let automod = to_json_opt(&config.automod, "automod")?;
         let command_aliases = to_json_opt(&config.command_aliases, "command_aliases")?;
 
-        sqlx::query(
+        let row = sqlx::query_as::<_, ConfigRow>(
             r#"INSERT INTO configs (
                    id,
                    prefix,
@@ -133,7 +172,20 @@ impl Database {
                    command_aliases
                ) VALUES (
                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-               )"#,
+               )
+               RETURNING
+                   id,
+                   prefix,
+                   mute_role,
+                   default_warn_duration,
+                   log_channel,
+                   prefer_embeds,
+                   inherit_discord_perms,
+                   alert_on_infraction,
+                   send_permission_denied,
+                   permission_groups,
+                   automod,
+                   command_aliases"#,
         )
         .bind(guild_id_i64)
         .bind(&config.prefix)
@@ -147,10 +199,23 @@ impl Database {
         .bind(permission_groups)
         .bind(automod)
         .bind(command_aliases)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(Config {
+            id: Id::new(row.id as u64),
+            prefix: row.prefix,
+            mute_role: row.mute_role.map(|v| Id::new(v as u64)),
+            default_warn_duration: row.default_warn_duration.map(|v| v as u64),
+            log_channel: row.log_channel.map(|v| Id::new(v as u64)),
+            prefer_embeds: row.prefer_embeds,
+            inherit_discord_perms: row.inherit_discord_perms,
+            alert_on_infraction: row.alert_on_infraction,
+            send_permission_denied: row.send_permission_denied,
+            permission_groups: parse_json_opt(row.permission_groups, "permission_groups")?,
+            automod: parse_json_opt(row.automod, "automod")?,
+            command_aliases: parse_json_opt(row.command_aliases, "command_aliases")?,
+        })
     }
 }
 

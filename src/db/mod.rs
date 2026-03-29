@@ -28,7 +28,7 @@ impl Database {
 
     /// Run the embedded migrations on startup.
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
-        sqlx::migrate!("../lib/migrations").run(&self.pool).await
+        sqlx::migrate!().run(&self.pool).await
     }
 
     pub fn pool(&self) -> &PgPool {
