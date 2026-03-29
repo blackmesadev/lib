@@ -1,42 +1,37 @@
 mod config;
 mod infractions;
 
-use mongodb::{options::ClientOptions, Client, Collection};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use tracing::instrument;
 
-use crate::model::{Config, Infraction};
-
-pub use mongodb;
-pub use mongodb::error::Error as MongoError;
+pub use sqlx::Error as DbError;
 
 pub struct Database {
-    db: mongodb::Database,
+    pool: PgPool,
 }
 
 impl Database {
     #[instrument(
         name = "db_connect",
         skip(connection_string),
-        fields(
-            database = %database_name
-        )
     )]
-    pub async fn connect(
-        connection_string: String,
-        database_name: &str,
-    ) -> Result<Self, MongoError> {
-        let options = ClientOptions::parse(connection_string).await?;
-        let client = Client::with_options(options)?;
-        let db = client.database(database_name);
+    pub async fn connect(connection_string: String) -> Result<Self, DbError> {
+        let pool = PgPoolOptions::new()
+            .min_connections(2)
+            .max_connections(10)
+            .connect(&connection_string)
+            .await?;
 
-        Ok(Self { db })
+        Ok(Self { pool })
     }
 
-    fn infractions(&self) -> Collection<Infraction> {
-        self.db.collection("infractions")
+    /// Run the embedded migrations on startup.
+    pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
+        sqlx::migrate!("../lib/migrations").run(&self.pool).await
     }
 
-    fn configs(&self) -> Collection<Config> {
-        self.db.collection("configs")
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 }

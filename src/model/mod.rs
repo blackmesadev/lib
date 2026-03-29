@@ -1,12 +1,10 @@
 pub mod automod;
 mod config;
 mod infraction;
-
-use std::str::FromStr;
+pub mod mesastream;
 
 pub use config::*;
 pub use infraction::{Infraction, InfractionType};
-use mongodb::bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +21,7 @@ impl UnixTimestamp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Uuid(ObjectId);
+pub struct Uuid(uuid::Uuid);
 
 impl Default for Uuid {
     fn default() -> Self {
@@ -33,14 +31,14 @@ impl Default for Uuid {
 
 impl Uuid {
     pub fn new() -> Self {
-        Self(ObjectId::new())
+        Self(uuid::Uuid::new_v4())
     }
 
     pub fn from_string(s: &str) -> Option<Self> {
-        ObjectId::from_str(s).map(Self).ok()
+        uuid::Uuid::parse_str(s).map(Self).ok()
     }
 
-    pub fn inner(&self) -> &ObjectId {
+    pub fn inner(&self) -> &uuid::Uuid {
         &self.0
     }
 }
@@ -51,20 +49,8 @@ impl std::fmt::Display for Uuid {
     }
 }
 
-impl From<ObjectId> for Uuid {
-    fn from(id: ObjectId) -> Self {
+impl From<uuid::Uuid> for Uuid {
+    fn from(id: uuid::Uuid) -> Self {
         Self(id)
-    }
-}
-
-impl From<Uuid> for ObjectId {
-    fn from(id: Uuid) -> Self {
-        id.0
-    }
-}
-
-impl From<Uuid> for bson::Bson {
-    fn from(uuid: Uuid) -> Self {
-        bson::Bson::ObjectId(uuid.0)
     }
 }

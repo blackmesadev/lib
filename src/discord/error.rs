@@ -2,13 +2,16 @@ use thiserror::Error;
 
 use crate::{
     cache::{MemoryCacheError, RedisCacheError},
-    db::MongoError,
+    db::DbError,
 };
 
 #[derive(Error, Debug)]
 pub enum DiscordError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("Middleware error: {0}")]
+    Middleware(#[from] reqwest_middleware::Error),
 
     #[error("WebSocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
@@ -21,6 +24,16 @@ pub enum DiscordError {
 
     #[error("Gateway not connected")]
     NotConnected,
+
+    /// Discord sent op 7 (RECONNECT) — caller should try to RESUME.
+    #[error("Discord requested reconnection")]
+    Reconnect,
+
+    /// Discord sent op 9 (INVALID_SESSION).
+    /// `true`  = session is resumable (try RESUME).
+    /// `false` = session is gone (must re-IDENTIFY).
+    #[error("Invalid session (resumable={0})")]
+    InvalidSession(bool),
 
     #[error("Gateway connection failed: {0}")]
     ConnectionFailed(String),
@@ -37,8 +50,8 @@ pub enum DiscordError {
     #[error("Redis cache error: {0}")]
     RedisCacheError(#[from] RedisCacheError),
 
-    #[error("MongoDB error: {0}")]
-    MongoError(#[from] MongoError),
+    #[error("Database error: {0}")]
+    DbError(#[from] DbError),
 
     #[error("Key not found: {0}")]
     KeyNotFound(String),

@@ -1,6 +1,6 @@
 use super::CacheBackend;
 use async_trait::async_trait;
-use redis::{aio::MultiplexedConnection, Client, ToRedisArgs};
+use redis::{aio::MultiplexedConnection, ToRedisArgs};
 use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 
@@ -12,19 +12,116 @@ pub enum RedisCacheError {
     Serialization(#[from] serde_json::Error),
 }
 
-#[derive(Debug)]
+/// Lazily prefixes a key at the redis wire layer — no allocation until
+/// `write_redis_args` is called.
+struct Prefixed<'a, K: ToRedisArgs> {
+    prefix: &'a [u8], // already includes the trailing ':'
+    key: &'a K,
+}
+
+/// Intercepts each arg the wrapped key emits and prepends the prefix.
+/// Reuses `buf` across multiple args (one allocation for the whole call).
+struct PrefixWriter<'a, W: ?Sized + redis::RedisWrite> {
+    buf: Vec<u8>,
+    prefix_end: usize,
+    out: &'a mut W,
+}
+
+impl<W: ?Sized + redis::RedisWrite> redis::RedisWrite for PrefixWriter<'_, W> {
+    fn write_arg(&mut self, arg: &[u8]) {
+        self.buf.truncate(self.prefix_end);
+        self.buf.extend_from_slice(arg);
+        self.out.write_arg(&self.buf);
+    }
+
+    fn write_arg_fmt(&mut self, arg: impl std::fmt::Display) {
+        self.write_arg(arg.to_string().as_bytes());
+    }
+
+    fn writer_for_next_arg(&mut self) -> impl std::io::Write + '_ {
+        self.buf.truncate(self.prefix_end);
+        PrefixCommit {
+            buf: &mut self.buf,
+            out: &mut *self.out,
+        }
+    }
+}
+
+/// Streaming counterpart to `PrefixWriter::write_arg`: accumulates bytes into
+/// `buf` then commits them on drop.
+struct PrefixCommit<'a, W: ?Sized + redis::RedisWrite> {
+    buf: &'a mut Vec<u8>,
+    out: &'a mut W,
+}
+
+impl<W: ?Sized + redis::RedisWrite> std::io::Write for PrefixCommit<'_, W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<W: ?Sized + redis::RedisWrite> Drop for PrefixCommit<'_, W> {
+    fn drop(&mut self) {
+        self.out.write_arg(self.buf);
+    }
+}
+
+impl<'a, K: ToRedisArgs> ToRedisArgs for Prefixed<'a, K> {
+    fn write_redis_args<W: ?Sized + redis::RedisWrite>(&self, out: &mut W) {
+        let mut w = PrefixWriter {
+            buf: {
+                let mut v = Vec::with_capacity(self.prefix.len() + 64);
+                v.extend_from_slice(self.prefix);
+                v
+            },
+            prefix_end: self.prefix.len(),
+            out,
+        };
+        self.key.write_redis_args(&mut w);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RedisCache {
-    client: Client,
+    conn: MultiplexedConnection,
+    /// Prefix bytes with trailing `:`  e.g. `b"myapp:"`
+    prefix: Box<[u8]>,
 }
 
 impl RedisCache {
-    pub async fn new(url: String) -> Result<Self, RedisCacheError> {
-        let client = Client::open(url)?;
-        Ok(Self { client })
+    pub async fn new(url: String, prefix: String) -> Result<Self, RedisCacheError> {
+        let conn = match redis::Client::open(url) {
+            Ok(client) => match client.get_multiplexed_async_connection().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::error!(error = %error, "Failed to connect to Redis");
+                    return Err(error.into());
+                }
+            },
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to initialize Redis client");
+                return Err(error.into());
+            }
+        };
+
+        let mut prefix_bytes = prefix.into_bytes();
+        prefix_bytes.push(b':');
+
+        Ok(Self {
+            conn,
+            prefix: prefix_bytes.into_boxed_slice(),
+        })
     }
 
-    async fn get_conn(&self) -> Result<MultiplexedConnection, RedisCacheError> {
-        Ok(self.client.get_multiplexed_tokio_connection().await?)
+    fn pk<'a, K: ToRedisArgs>(&'a self, key: &'a K) -> Prefixed<'a, K> {
+        Prefixed {
+            prefix: &self.prefix,
+            key,
+        }
     }
 }
 
@@ -38,7 +135,7 @@ impl CacheBackend for RedisCache {
         V: Serialize + Send + Sync,
     {
         let start = std::time::Instant::now();
-        let value = match serde_json::to_string(value) {
+        let value = match serde_json::to_vec(value) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = ?e, "Failed to serialize value");
@@ -46,18 +143,19 @@ impl CacheBackend for RedisCache {
             }
         };
 
+        let mut conn = self.conn.clone();
         let result = if let Some(ttl) = ttl {
             redis::cmd("SETEX")
-                .arg(key)
+                .arg(self.pk(&key))
                 .arg(ttl.as_secs() as usize)
                 .arg(value)
-                .exec_async(&mut self.get_conn().await?)
+                .exec_async(&mut conn)
                 .await
         } else {
             redis::cmd("SET")
-                .arg(key)
+                .arg(self.pk(&key))
                 .arg(value)
-                .exec_async(&mut self.get_conn().await?)
+                .exec_async(&mut conn)
                 .await
         };
 
@@ -75,15 +173,27 @@ impl CacheBackend for RedisCache {
         K: ToRedisArgs + Send + Sync,
         V: DeserializeOwned,
     {
-        let start = std::time::Instant::now();
-
-        let result: Option<String> = redis::cmd("GET")
-            .arg(key)
-            .query_async(&mut self.get_conn().await?)
-            .await?;
+        let mut conn = self.conn.clone();
+        let result: Option<Vec<u8>> = match redis::cmd("GET")
+            .arg(self.pk(key))
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis GET operation failed");
+                return Err(error.into());
+            }
+        };
 
         match result {
-            Some(v) => Ok(Some(serde_json::from_str(&v)?)),
+            Some(v) => match serde_json::from_slice(&v) {
+                Ok(value) => Ok(Some(value)),
+                Err(error) => {
+                    tracing::error!(error = %error, "Failed to deserialize Redis value");
+                    Err(error.into())
+                }
+            },
             None => Ok(None),
         }
     }
@@ -92,24 +202,40 @@ impl CacheBackend for RedisCache {
     where
         K: ToRedisArgs + Send + Sync,
     {
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.conn.clone();
 
-        let result = if let Some(ttl) = ttl {
-            redis::cmd("INCR")
-                .arg(key)
-                .arg("EX")
+        let value: u64 = if let Some(ttl) = ttl {
+            let (v, _): (u64, bool) = match redis::pipe()
+                .cmd("INCR")
+                .arg(self.pk(key))
+                .cmd("EXPIRE")
+                .arg(self.pk(key))
                 .arg(ttl.as_secs() as usize)
                 .query_async(&mut conn)
                 .await
+            {
+                Ok(v) => v,
+                Err(error) => {
+                    tracing::error!(error = %error, "Redis INCR+EXPIRE pipeline failed");
+                    return Err(error.into());
+                }
+            };
+            v
         } else {
-            redis::cmd("INCR").arg(key).query_async(&mut conn).await
+            match redis::cmd("INCR")
+                .arg(self.pk(key))
+                .query_async(&mut conn)
+                .await
+            {
+                Ok(v) => v,
+                Err(error) => {
+                    tracing::error!(error = %error, "Redis INCR operation failed");
+                    return Err(error.into());
+                }
+            }
         };
 
-        if let Err(e) = &result {
-            tracing::error!(error = ?e, "Redis operation failed");
-        }
-
-        result.map_err(Into::into)
+        Ok(value)
     }
 
     async fn incrby<K>(
@@ -121,38 +247,58 @@ impl CacheBackend for RedisCache {
     where
         K: ToRedisArgs + Send + Sync,
     {
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.conn.clone();
 
-        let result = if let Some(ttl) = ttl {
-            redis::cmd("INCRBY")
-                .arg(key)
+        let next_value: u64 = if let Some(ttl) = ttl {
+            let (v, _): (u64, bool) = match redis::pipe()
+                .cmd("INCRBY")
+                .arg(self.pk(key))
                 .arg(value)
-                .arg("EX")
+                .cmd("EXPIRE")
+                .arg(self.pk(key))
                 .arg(ttl.as_secs() as usize)
                 .query_async(&mut conn)
                 .await
+            {
+                Ok(v) => v,
+                Err(error) => {
+                    tracing::error!(error = %error, "Redis INCRBY+EXPIRE pipeline failed");
+                    return Err(error.into());
+                }
+            };
+            v
         } else {
-            redis::cmd("INCRBY")
-                .arg(key)
+            match redis::cmd("INCRBY")
+                .arg(self.pk(key))
                 .arg(value)
                 .query_async(&mut conn)
                 .await
+            {
+                Ok(v) => v,
+                Err(error) => {
+                    tracing::error!(error = %error, "Redis INCRBY operation failed");
+                    return Err(error.into());
+                }
+            }
         };
 
-        if let Err(e) = &result {
-            tracing::error!(error = ?e, "Redis operation failed");
-        }
-
-        result.map_err(Into::into)
+        Ok(next_value)
     }
 
     async fn delete<K>(&self, key: &K) -> Result<(), Self::Error>
     where
         K: ToRedisArgs + Send + Sync,
     {
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.conn.clone();
 
-        redis::cmd("DEL").arg(key).exec_async(&mut conn).await?;
+        if let Err(error) = redis::cmd("DEL")
+            .arg(self.pk(key))
+            .exec_async(&mut conn)
+            .await
+        {
+            tracing::error!(error = %error, "Redis DEL operation failed");
+            return Err(error.into());
+        }
 
         Ok(())
     }
@@ -161,9 +307,19 @@ impl CacheBackend for RedisCache {
     where
         K: ToRedisArgs + Send + Sync,
     {
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.conn.clone();
 
-        let exists: bool = redis::cmd("EXISTS").arg(key).query_async(&mut conn).await?;
+        let exists: bool = match redis::cmd("EXISTS")
+            .arg(self.pk(key))
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(exists) => exists,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis EXISTS operation failed");
+                return Err(error.into());
+            }
+        };
 
         Ok(exists)
     }
@@ -172,14 +328,21 @@ impl CacheBackend for RedisCache {
     where
         K: ToRedisArgs + Send + Sync,
     {
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.conn.clone();
 
-        let added: bool = redis::cmd("ZADD")
-            .arg(key)
+        let added: bool = match redis::cmd("ZADD")
+            .arg(self.pk(key))
             .arg(score)
             .arg(member)
             .query_async(&mut conn)
-            .await?;
+            .await
+        {
+            Ok(added) => added,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis ZADD operation failed");
+                return Err(error.into());
+            }
+        };
 
         Ok(added)
     }
@@ -188,14 +351,21 @@ impl CacheBackend for RedisCache {
     where
         K: ToRedisArgs + Send + Sync,
     {
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.conn.clone();
 
-        let removed: u64 = redis::cmd("ZREMRANGEBYSCORE")
-            .arg(key)
+        let removed: u64 = match redis::cmd("ZREMRANGEBYSCORE")
+            .arg(self.pk(key))
             .arg(min)
             .arg(max)
             .query_async(&mut conn)
-            .await?;
+            .await
+        {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis ZREMRANGEBYSCORE operation failed");
+                return Err(error.into());
+            }
+        };
 
         Ok(removed)
     }
@@ -204,9 +374,19 @@ impl CacheBackend for RedisCache {
     where
         K: ToRedisArgs + Send + Sync,
     {
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.conn.clone();
 
-        let count: u64 = redis::cmd("ZCARD").arg(key).query_async(&mut conn).await?;
+        let count: u64 = match redis::cmd("ZCARD")
+            .arg(self.pk(key))
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis ZCARD operation failed");
+                return Err(error.into());
+            }
+        };
 
         Ok(count)
     }
@@ -215,14 +395,33 @@ impl CacheBackend for RedisCache {
     where
         K: ToRedisArgs + Send + Sync,
     {
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.conn.clone();
 
-        let set: bool = redis::cmd("EXPIRE")
-            .arg(key)
+        let set: bool = match redis::cmd("EXPIRE")
+            .arg(self.pk(key))
             .arg(ttl.as_secs() as usize)
             .query_async(&mut conn)
-            .await?;
+            .await
+        {
+            Ok(set) => set,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis EXPIRE operation failed");
+                return Err(error.into());
+            }
+        };
 
         Ok(set)
+    }
+
+    async fn ping(&self) -> Result<bool, Self::Error> {
+        let mut conn = self.conn.clone();
+
+        match redis::cmd("PING").query_async::<String>(&mut conn).await {
+            Ok(response) => Ok(response == "PONG"),
+            Err(error) => {
+                tracing::error!(error = %error, "Redis PING operation failed");
+                Err(error.into())
+            }
+        }
     }
 }

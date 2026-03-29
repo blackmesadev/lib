@@ -4,10 +4,14 @@ use crate::discord::{
 };
 use dashmap::DashMap;
 use reqwest::{header::HeaderMap, Client, Method, Response};
+use reqwest_middleware::{ClientBuilder as MiddlewareClientBuilder, ClientWithMiddleware};
+use reqwest_tracing::TracingMiddleware;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    borrow::Cow, error::Error, time::{Duration, Instant}
+    borrow::Cow,
+    time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -16,6 +20,9 @@ use tracing::instrument;
 use super::{DiscordError, Embed, Guild, Id, Message};
 
 const API_BASE: &str = "https://discord.com/api/v10";
+const REQUEST_TIMEOUT_SECS: u64 = 10;
+const USER_ERROR_DISCORD_REQUEST: &str = "An error occurred while communicating with Discord.";
+const USER_ERROR_DISCORD_RESPONSE: &str = "An error occurred while processing a Discord response.";
 
 #[derive(Debug, Clone)]
 struct RateLimit {
@@ -56,7 +63,7 @@ impl RateLimit {
 }
 
 pub struct DiscordRestClient {
-    client: Client,
+    client: ClientWithMiddleware,
     token: Cow<'static, str>,
     rate_limits: DashMap<String, RateLimit>,
     global_rate_limit: RwLock<Option<(Instant, Duration)>>,
@@ -64,15 +71,21 @@ pub struct DiscordRestClient {
 
 impl DiscordRestClient {
     pub fn new(token: &str) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .tls_built_in_root_certs(true)
+        let reqwest_client = Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .user_agent(format!(
                 "DiscordBot (github.com/blackmesadev/lib, {})",
                 env!("CARGO_PKG_VERSION")
             ))
             .build()
-            .expect("Failed to create HTTP client");
+            .unwrap_or_else(|error| {
+                tracing::error!(error = %error, "Failed to construct configured HTTP client, using fallback client");
+                Client::new()
+            });
+
+        let client = MiddlewareClientBuilder::new(reqwest_client)
+            .with(TracingMiddleware::default())
+            .build();
 
         tracing::info!("Discord REST client initialized");
 
@@ -89,6 +102,117 @@ impl DiscordRestClient {
     #[inline]
     fn build_url(&self, path: &str) -> String {
         format!("{}{}", API_BASE, path)
+    }
+
+    #[inline]
+    fn channel_messages_path(channel_id: &Id) -> String {
+        format!("/channels/{}/messages", channel_id)
+    }
+
+    #[inline]
+    fn message_path(channel_id: &Id, message_id: &Id) -> String {
+        format!("/channels/{}/messages/{}", channel_id, message_id)
+    }
+
+    #[inline]
+    fn build_audit_log_headers(reason: Option<impl AsRef<str>>) -> Option<HeaderMap> {
+        let reason = reason?;
+        let Ok(header_value) = reason.as_ref().parse() else {
+            tracing::warn!("Invalid X-Audit-Log-Reason header value, dropping reason");
+            return None;
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Audit-Log-Reason", header_value);
+        Some(headers)
+    }
+
+    #[instrument(skip(self, data, headers), fields(method = ?method, path = path, endpoint = endpoint))]
+    async fn request_json<T, R>(
+        &self,
+        method: Method,
+        path: &str,
+        data: Option<T>,
+        headers: Option<HeaderMap>,
+        endpoint: &str,
+    ) -> DiscordResult<R>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        let response = match self
+            .make_request(method, path, data, headers, endpoint)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::error!(error = %error, endpoint = endpoint, "Discord request failed");
+                return Err(DiscordError::Other(USER_ERROR_DISCORD_REQUEST.into()));
+            }
+        };
+
+        match response.json().await {
+            Ok(payload) => Ok(payload),
+            Err(error) => {
+                tracing::error!(error = %error, endpoint = endpoint, "Failed to parse Discord response body");
+                Err(DiscordError::Other(USER_ERROR_DISCORD_RESPONSE.into()))
+            }
+        }
+    }
+
+    #[instrument(skip(self, data, headers), fields(method = ?method, path = path, endpoint = endpoint))]
+    async fn request_empty<T>(
+        &self,
+        method: Method,
+        path: &str,
+        data: Option<T>,
+        headers: Option<HeaderMap>,
+        endpoint: &str,
+    ) -> DiscordResult<()>
+    where
+        T: Serialize,
+    {
+        match self
+            .make_request(method, path, data, headers, endpoint)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::error!(error = %error, endpoint = endpoint, "Discord request failed");
+                Err(DiscordError::Other(USER_ERROR_DISCORD_REQUEST.into()))
+            }
+        }
+    }
+
+    #[instrument(skip(self, data), fields(method = ?method, action = action))]
+    fn spawn_fire_and_forget(
+        &self,
+        method: Method,
+        path: String,
+        data: Option<Value>,
+        action: &'static str,
+    ) {
+        let client = self.client.clone();
+        let token = self.token.clone();
+        let url = self.build_url(&path);
+
+        tokio::spawn(async move {
+            let mut request = client
+                .request(method, &url)
+                .header("Authorization", token.as_ref());
+
+            if let Some(data) = data {
+                if let Ok(body) = serde_json::to_string(&data) {
+                    request = request
+                        .header("Content-Type", "application/json")
+                        .body(body);
+                }
+            }
+
+            if let Err(error) = request.send().await {
+                tracing::error!(error = %error, action = action, "Discord fire-and-forget request failed");
+            }
+        });
     }
 
     #[instrument(skip(self, data), fields(method = ?method, path = path))]
@@ -123,31 +247,16 @@ impl DiscordRestClient {
             }
 
             let url = self.build_url(path);
+            let mut req = self
+                .client
+                .request(method.clone(), &url)
+                .header("Authorization", self.token.as_ref());
 
-            let request = match method {
-                Method::GET => self.client.get(&url),
-                Method::POST => {
-                    let request = self.client.post(&url);
-                    if let Some(ref data) = data {
-                        request.json(&data)
-                    } else {
-                        request
-                    }
+            if let Some(ref data) = data {
+                if let Ok(body) = serde_json::to_string(data) {
+                    req = req.header("Content-Type", "application/json").body(body);
                 }
-                Method::PUT => self.client.put(&url),
-                Method::PATCH => {
-                    let request = self.client.patch(&url);
-                    if let Some(ref data) = data {
-                        request.json(&data)
-                    } else {
-                        request
-                    }
-                }
-                Method::DELETE => self.client.delete(&url),
-                _ => self.client.get(&url),
-            };
-
-            let mut req = request.header("Authorization", self.token.as_ref());
+            }
 
             if let Some(ref headers) = headers {
                 for (key, value) in headers.iter() {
@@ -159,10 +268,9 @@ impl DiscordRestClient {
                 tracing::error!(
                     error = %e,
                     url = url,
-                    source = ?e.source(),
                     "Discord API request failed"
                 );
-                DiscordError::Http(e)
+                DiscordError::Middleware(e)
             })?;
 
             if response.status() == 429 {
@@ -184,12 +292,18 @@ impl DiscordRestClient {
             }
 
             if !response.status().is_success() {
+                let status = response.status().as_u16();
                 tracing::error!(
-                    status = response.status().as_u16(),
+                    status = status,
                     endpoint = endpoint,
                     "Discord API request failed"
                 );
-                return Err(response.error_for_status().unwrap_err().into());
+
+                if let Err(error) = response.error_for_status_ref() {
+                    tracing::error!(error = %error, endpoint = endpoint, "Discord API returned error status");
+                }
+
+                return Err(DiscordError::Other(USER_ERROR_DISCORD_REQUEST.into()));
             }
 
             let rate_limit = RateLimit::from_headers(response.headers());
@@ -202,127 +316,128 @@ impl DiscordRestClient {
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn get_gateway(&self) -> DiscordResult<Gateway> {
-        let response = self
-            .make_request(Method::GET, "/gateway", Option::<()>::None, None, "gateway")
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(Method::GET, "/gateway", Option::<()>::None, None, "gateway")
+            .await
     }
 
+    #[instrument(skip(self), fields(channel_id = %channel_id))]
     pub async fn get_channel(&self, channel_id: &Id) -> DiscordResult<Channel> {
-        let response = self
-            .make_request(
-                Method::GET,
-                &format!("/channels/{}", channel_id),
-                Option::<()>::None,
-                None,
-                "channel",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::GET,
+            &format!("/channels/{}", channel_id),
+            Option::<()>::None,
+            None,
+            "channel",
+        )
+        .await
     }
 
+    #[instrument(skip(self), fields(guild_id = %guild_id))]
     pub async fn get_guild(&self, guild_id: &Id) -> DiscordResult<Guild> {
-        let response = self
-            .make_request(
-                Method::GET,
-                &format!("/guilds/{}", guild_id),
-                Option::<()>::None,
-                None,
-                "guild",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::GET,
+            &format!("/guilds/{}", guild_id),
+            Option::<()>::None,
+            None,
+            "guild",
+        )
+        .await
     }
 
+    #[instrument(skip(self), fields(guild_id = %guild_id))]
+    pub async fn get_guild_with_counts(&self, guild_id: &Id) -> DiscordResult<Guild> {
+        self.request_json(
+            Method::GET,
+            &format!("/guilds/{}?with_counts=true", guild_id),
+            Option::<()>::None,
+            None,
+            "guild",
+        )
+        .await
+    }
+
+    #[instrument(skip(self), fields(guild_id = %guild_id))]
     pub async fn get_guild_channels(&self, guild_id: &Id) -> DiscordResult<Vec<Channel>> {
-        let response = self
-            .make_request(
-                Method::GET,
-                &format!("/guilds/{}/channels", guild_id),
-                Option::<()>::None,
-                None,
-                "guild",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::GET,
+            &format!("/guilds/{}/channels", guild_id),
+            Option::<()>::None,
+            None,
+            "guild",
+        )
+        .await
     }
 
+    #[instrument(skip(self), fields(guild_id = %guild_id))]
     pub async fn get_guild_members(&self, guild_id: &Id) -> DiscordResult<Vec<Member>> {
-        let response = self
-            .make_request(
-                Method::GET,
-                &format!("/guilds/{}/members", guild_id),
-                Option::<()>::None,
-                None,
-                "guild",
-            )
-            .await?;
-        let members = response.json().await?;
-
-        Ok(members)
+        self.request_json(
+            Method::GET,
+            &format!("/guilds/{}/members", guild_id),
+            Option::<()>::None,
+            None,
+            "guild",
+        )
+        .await
     }
 
+    #[instrument(skip(self), fields(guild_id = %guild_id, user_id = %user_id))]
     pub async fn get_member(&self, guild_id: &Id, user_id: &Id) -> DiscordResult<Member> {
-        let response = self
-            .make_request(
-                Method::GET,
-                &format!("/guilds/{}/members/{}", guild_id, user_id),
-                Option::<()>::None,
-                None,
-                "guild",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::GET,
+            &format!("/guilds/{}/members/{}", guild_id, user_id),
+            Option::<()>::None,
+            None,
+            "guild",
+        )
+        .await
     }
 
+    #[instrument(skip(self), fields(guild_id = %guild_id))]
     pub async fn get_roles(&self, guild_id: &Id) -> DiscordResult<Vec<Role>> {
-        let response = self
-            .make_request(
-                Method::GET,
-                &format!("/guilds/{}/roles", guild_id),
-                Option::<()>::None,
-                None,
-                "guild",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::GET,
+            &format!("/guilds/{}/roles", guild_id),
+            Option::<()>::None,
+            None,
+            "guild",
+        )
+        .await
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn get_user(&self, user_id: &Id) -> DiscordResult<User> {
-        let response = self
-            .make_request(
-                Method::GET,
-                &format!("/users/{}", user_id),
-                Option::<()>::None,
-                None,
-                "user",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::GET,
+            &format!("/users/{}", user_id),
+            Option::<()>::None,
+            None,
+            "user",
+        )
+        .await
     }
 
+    #[instrument(skip(self))]
     pub async fn get_current_user(&self) -> DiscordResult<User> {
-        let response = self
-            .make_request(Method::GET, "/users/@me", Option::<()>::None, None, "user")
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(Method::GET, "/users/@me", Option::<()>::None, None, "user")
+            .await
     }
 
+    #[instrument(skip(self, content), fields(channel_id = %channel_id))]
     pub async fn create_message(&self, channel_id: &Id, content: &str) -> DiscordResult<Message> {
         let data = json!({ "content": content });
-        let response = self
-            .make_request(
-                Method::POST,
-                &format!("/channels/{}/messages", channel_id),
-                Some(&data),
-                None,
-                "channel",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::POST,
+            &Self::channel_messages_path(channel_id),
+            Some(&data),
+            None,
+            "channel",
+        )
+        .await
     }
 
+    #[instrument(skip(self, content), fields(channel_id = %channel_id, message_id = %message_id))]
     pub async fn edit_message(
         &self,
         channel_id: &Id,
@@ -330,94 +445,77 @@ impl DiscordRestClient {
         content: &str,
     ) -> DiscordResult<Message> {
         let data = json!({ "content": content });
-        let response = self
-            .make_request(
-                Method::PATCH,
-                &format!("/channels/{}/messages/{}", channel_id, message_id),
-                Some(&data),
-                None,
-                "channel",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::PATCH,
+            &Self::message_path(channel_id, message_id),
+            Some(&data),
+            None,
+            "channel",
+        )
+        .await
     }
 
+    #[instrument(skip(self, content), fields(channel_id = %channel_id))]
     pub async fn create_message_no_ping(
         &self,
         channel_id: &Id,
         content: &str,
     ) -> DiscordResult<Message> {
         let data = json!({ "content": content, "allowed_mentions": { "parse": [] } });
-        let response = self
-            .make_request(
-                Method::POST,
-                &format!("/channels/{}/messages", channel_id),
-                Some(&data),
-                None,
-                "channel",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::POST,
+            &Self::channel_messages_path(channel_id),
+            Some(&data),
+            None,
+            "channel",
+        )
+        .await
     }
 
+    #[instrument(skip(self, content), fields(channel_id = %channel_id))]
     pub async fn create_message_and_forget(&self, channel_id: &Id, content: &str) {
         let data = json!({ "content": content });
-        let client = self.client.clone();
-        let token = self.token.clone();
-        let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
-        tokio::spawn(async move {
-            if let Err(e) = client
-                .post(url)
-                .header("Authorization", token.as_ref())
-                .json(&data)
-                .send()
-                .await
-            {
-                tracing::error!("Failed to send message: {:?}", e);
-            }
-        });
+        self.spawn_fire_and_forget(
+            Method::POST,
+            Self::channel_messages_path(channel_id),
+            Some(data),
+            "create_message",
+        );
     }
 
+    #[instrument(skip(self, embeds), fields(channel_id = %channel_id))]
     pub async fn create_message_with_embed(
         &self,
         channel_id: &Id,
         embeds: &[Embed],
     ) -> DiscordResult<Message> {
         let data = json!({ "embeds": embeds });
-        let response = self
-            .make_request(
-                Method::POST,
-                &format!("/channels/{}/messages", channel_id),
-                Some(&data),
-                None,
-                "channel",
-            )
-            .await?;
-        response.json().await.map_err(Into::into)
+        self.request_json(
+            Method::POST,
+            &Self::channel_messages_path(channel_id),
+            Some(&data),
+            None,
+            "channel",
+        )
+        .await
     }
 
+    #[instrument(skip(self, embeds), fields(channel_id = %channel_id))]
     pub async fn create_message_with_embed_and_forget(&self, channel_id: &Id, embeds: &[Embed]) {
         let data = json!({ "embeds": embeds });
-        let client = self.client.clone();
-        let token = self.token.clone();
-        let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
-        tokio::spawn(async move {
-            if let Err(e) = client
-                .post(url)
-                .header("Authorization", token.as_ref())
-                .json(&data)
-                .send()
-                .await
-            {
-                tracing::error!("Failed to send message: {:?}", e);
-            }
-        });
+        self.spawn_fire_and_forget(
+            Method::POST,
+            Self::channel_messages_path(channel_id),
+            Some(data),
+            "create_message_embed",
+        );
     }
 
+    #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn create_dm_channel(&self, user_id: &Id) -> DiscordResult<Id> {
         let data = json!({ "recipient_id": user_id });
-        let response = self
-            .make_request(
+        let channel: Value = self
+            .request_json(
                 Method::POST,
                 "/users/@me/channels",
                 Some(&data),
@@ -425,42 +523,38 @@ impl DiscordRestClient {
                 "channel",
             )
             .await?;
-        let channel: Value = response.json().await?;
-        let channel_id = channel["id"]
-            .as_str()
-            .ok_or(DiscordError::KeyNotFound("Channel ID not found".into()))?;
-        channel_id
-            .parse()
-            .map_err(|_| DiscordError::ParseError("Channel ID".into()))
+
+        let Some(channel_id) = channel["id"].as_str() else {
+            tracing::error!(payload = ?channel, "Discord DM channel payload missing id");
+            return Err(DiscordError::Other(USER_ERROR_DISCORD_RESPONSE.into()));
+        };
+
+        channel_id.parse().map_err(|error| {
+            tracing::error!(error = ?error, channel_id = channel_id, "Failed to parse Discord DM channel id");
+            DiscordError::Other(USER_ERROR_DISCORD_RESPONSE.into())
+        })
     }
 
+    #[instrument(skip(self, reason), fields(guild_id = %guild_id, user_id = %user_id))]
     pub async fn kick_member(
         &self,
         guild_id: &Id,
         user_id: &Id,
         reason: Option<impl AsRef<str>>,
     ) -> DiscordResult<()> {
-        let headers = reason.and_then(|r| {
-            let mut headers = HeaderMap::new();
-            if let Ok(header_value) = r.as_ref().parse() {
-                headers.insert("X-Audit-Log-Reason", header_value);
-                Some(headers)
-            } else {
-                None
-            }
-        });
+        let headers = Self::build_audit_log_headers(reason);
 
-        self.make_request(
+        self.request_empty(
             Method::DELETE,
             &format!("/guilds/{}/members/{}", guild_id, user_id),
             Option::<()>::None,
             headers,
             "guild",
         )
-        .await?;
-        Ok(())
+        .await
     }
 
+    #[instrument(skip(self, reason), fields(guild_id = %guild_id, user_id = %user_id, delete_message_days = delete_message_days))]
     pub async fn ban_member(
         &self,
         guild_id: &Id,
@@ -468,55 +562,39 @@ impl DiscordRestClient {
         reason: Option<impl AsRef<str>>,
         delete_message_days: u8,
     ) -> DiscordResult<()> {
-        let headers = reason.and_then(|r| {
-            let mut headers = HeaderMap::new();
-            if let Ok(header_value) = r.as_ref().parse() {
-                headers.insert("X-Audit-Log-Reason", header_value);
-                Some(headers)
-            } else {
-                None
-            }
-        });
+        let headers = Self::build_audit_log_headers(reason);
 
         let data = json!({ "delete_message_days": delete_message_days });
-        self.make_request(
+        self.request_empty(
             Method::PUT,
             &format!("/guilds/{}/bans/{}", guild_id, user_id),
             Some(&data),
             headers,
             "guild",
         )
-        .await?;
-        Ok(())
+        .await
     }
 
+    #[instrument(skip(self, reason), fields(guild_id = %guild_id, user_id = %user_id))]
     pub async fn unban_member(
         &self,
         guild_id: &Id,
         user_id: &Id,
         reason: Option<impl AsRef<str>>,
     ) -> DiscordResult<()> {
-        let headers = reason.and_then(|r| {
-            let mut headers = HeaderMap::new();
-            if let Ok(header_value) = r.as_ref().parse() {
-                headers.insert("X-Audit-Log-Reason", header_value);
-                Some(headers)
-            } else {
-                None
-            }
-        });
+        let headers = Self::build_audit_log_headers(reason);
 
-        self.make_request(
+        self.request_empty(
             Method::DELETE,
             &format!("/guilds/{}/bans/{}", guild_id, user_id),
             Option::<()>::None,
             headers,
             "guild",
         )
-        .await?;
-        Ok(())
+        .await
     }
 
+    #[instrument(skip(self, reason), fields(guild_id = %guild_id, user_id = %user_id, role_id = %role_id))]
     pub async fn add_role(
         &self,
         guild_id: &Id,
@@ -524,27 +602,19 @@ impl DiscordRestClient {
         role_id: &Id,
         reason: Option<impl AsRef<str>>,
     ) -> DiscordResult<()> {
-        let headers = reason.and_then(|r| {
-            let mut headers = HeaderMap::new();
-            if let Ok(header_value) = r.as_ref().parse() {
-                headers.insert("X-Audit-Log-Reason", header_value);
-                Some(headers)
-            } else {
-                None
-            }
-        });
+        let headers = Self::build_audit_log_headers(reason);
 
-        self.make_request(
+        self.request_empty(
             Method::PUT,
             &format!("/guilds/{}/members/{}/roles/{}", guild_id, user_id, role_id),
             Option::<()>::None,
             headers,
             "guild",
         )
-        .await?;
-        Ok(())
+        .await
     }
 
+    #[instrument(skip(self, reason), fields(guild_id = %guild_id, user_id = %user_id, role_id = %role_id))]
     pub async fn remove_role(
         &self,
         guild_id: &Id,
@@ -552,55 +622,37 @@ impl DiscordRestClient {
         role_id: &Id,
         reason: Option<impl AsRef<str>>,
     ) -> DiscordResult<()> {
-        let headers = reason.and_then(|r| {
-            let mut headers = HeaderMap::new();
-            if let Ok(header_value) = r.as_ref().parse() {
-                headers.insert("X-Audit-Log-Reason", header_value);
-                Some(headers)
-            } else {
-                None
-            }
-        });
+        let headers = Self::build_audit_log_headers(reason);
 
-        self.make_request(
+        self.request_empty(
             Method::DELETE,
             &format!("/guilds/{}/members/{}/roles/{}", guild_id, user_id, role_id),
             Option::<()>::None,
             headers,
             "guild",
         )
-        .await?;
-        Ok(())
+        .await
     }
 
+    #[instrument(skip(self), fields(channel_id = %channel_id, message_id = %message_id))]
     pub async fn delete_message(&self, channel_id: &Id, message_id: &Id) -> DiscordResult<()> {
-        self.make_request(
+        self.request_empty(
             Method::DELETE,
-            &format!("/channels/{}/messages/{}", channel_id, message_id),
+            &Self::message_path(channel_id, message_id),
             Option::<()>::None,
             None,
             "channel",
         )
-        .await?;
-        Ok(())
+        .await
     }
 
+    #[instrument(skip(self), fields(channel_id = %channel_id, message_id = %message_id))]
     pub async fn delete_message_and_forget(&self, channel_id: &Id, message_id: &Id) {
-        let client = self.client.clone();
-        let token = self.token.clone();
-        let url = format!(
-            "{}/channels/{}/messages/{}",
-            API_BASE, channel_id, message_id
+        self.spawn_fire_and_forget(
+            Method::DELETE,
+            Self::message_path(channel_id, message_id),
+            None,
+            "delete_message",
         );
-        tokio::spawn(async move {
-            if let Err(e) = client
-                .delete(url)
-                .header("Authorization", token.as_ref())
-                .send()
-                .await
-            {
-                tracing::error!("Failed to delete message: {:?}", e);
-            }
-        });
     }
 }

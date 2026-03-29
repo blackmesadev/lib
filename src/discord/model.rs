@@ -142,6 +142,21 @@ pub struct Identify {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Resume {
+    pub token: Cow<'static, str>,
+    pub session_id: String,
+    pub seq: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VoiceStateUpdateOutgoing {
+    pub guild_id: Id,
+    pub channel_id: Option<Id>,
+    pub self_mute: bool,
+    pub self_deaf: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectionProperties {
     #[serde(rename = "$os")]
     pub os: Cow<'static, str>,
@@ -456,8 +471,11 @@ pub struct Guild {
     pub icon: Option<SmolStr>,
     #[serde(default)]
     pub roles: HashSet<Role>,
-    pub approximate_member_count: Option<u32>,
+    pub member_count: Option<u32>, // From GUILD_CREATE gateway event
+    pub approximate_member_count: Option<u32>, // From REST API with ?with_counts=true
     pub owner_id: Option<Id>,
+    #[serde(default)]
+    pub voice_states: Vec<VoiceStateUpdate>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -479,6 +497,29 @@ pub struct GuildMemberUpdate {
     pub premium_since: Option<String>,
     pub deaf: bool,
     pub mute: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceStateUpdate {
+    pub guild_id: Option<Id>,
+    pub channel_id: Option<Id>,
+    pub user_id: Id,
+    pub session_id: String,
+    #[serde(default)]
+    pub deaf: bool,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub self_deaf: bool,
+    #[serde(default)]
+    pub self_mute: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceServerUpdate {
+    pub token: String,
+    pub guild_id: Id,
+    pub endpoint: Option<String>,
 }
 
 bitflags::bitflags! {

@@ -9,44 +9,61 @@ use std::{
 
 use crate::discord::{
     error::{DiscordError, DiscordResult},
-    model::{ConnectionProperties, Identify, Payload},
+    model::{ConnectionProperties, Identify, Payload, Resume, VoiceStateUpdateOutgoing},
     Message as DiscordMessage,
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::{
     net::TcpStream,
-    time::{sleep, Interval},
+    sync::{mpsc, Mutex},
+    time::{sleep, Duration},
 };
-use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::instrument;
 
 use super::{DiscordRestClient, Guild, GuildMemberUpdate, Hello, Intents, Ready, ShardConfig};
+use super::{Id, VoiceServerUpdate, VoiceStateUpdate};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
+type WsSource = futures_util::stream::SplitStream<WsStream>;
 
-// Discord Gateway opcodes
+// Opcode constants from https://docs.discord.com/developers/topics/opcodes-and-status-codes
+
 const OPCODE_DISPATCH: u8 = 0;
 const OPCODE_HEARTBEAT: u8 = 1;
 const OPCODE_IDENTIFY: u8 = 2;
+#[allow(dead_code)]
+const OPCODE_PRESENCE_UPDATE: u8 = 3;
+const OPCODE_VOICE_STATE_UPDATE: u8 = 4;
 const OPCODE_RESUME: u8 = 6;
 const OPCODE_RECONNECT: u8 = 7;
+#[allow(dead_code)]
+const OPCODE_REQUEST_GUILD_MEMBERS: u8 = 8;
 const OPCODE_INVALID_SESSION: u8 = 9;
 const OPCODE_HELLO: u8 = 10;
 const OPCODE_HEARTBEAT_ACK: u8 = 11;
 
-// Event type constants
+// Event type constants from https://docs.discord.com/developers/events/gateway-events
+
 const EVENT_READY: &str = "READY";
 const EVENT_GUILD_CREATE: &str = "GUILD_CREATE";
 const EVENT_GUILD_UPDATE: &str = "GUILD_UPDATE";
 const EVENT_GUILD_MEMBER_UPDATE: &str = "GUILD_MEMBER_UPDATE";
 const EVENT_MESSAGE_CREATE: &str = "MESSAGE_CREATE";
 const EVENT_MESSAGE_UPDATE: &str = "MESSAGE_UPDATE";
+const EVENT_VOICE_STATE_UPDATE: &str = "VOICE_STATE_UPDATE";
+const EVENT_VOICE_SERVER_UPDATE: &str = "VOICE_SERVER_UPDATE";
+
+const INVALID_SESSION_RETRY_SECS: u64 = 5;
+const CHANNEL_CAPACITY: usize = 256;
 
 #[derive(serde::Deserialize)]
 struct PayloadEnvelope {
     op: u8,
+    d: Option<serde_json::Value>,
     s: Option<u64>,
     t: Option<String>,
 }
@@ -58,332 +75,701 @@ pub enum Event {
     GuildCreate(Guild),
     GuildUpdate(Guild),
     GuildMemberUpdate(GuildMemberUpdate),
+    VoiceStateUpdate(VoiceStateUpdate),
+    VoiceServerUpdate(VoiceServerUpdate),
+}
+
+impl Event {
+    /// Returns the event type name as a static string.
+    pub const fn event_name(&self) -> &'static str {
+        match self {
+            Event::Ready(_) => "Ready",
+            Event::MessageCreate(_) => "MessageCreate",
+            Event::GuildCreate(_) => "GuildCreate",
+            Event::GuildUpdate(_) => "GuildUpdate",
+            Event::GuildMemberUpdate(_) => "GuildMemberUpdate",
+            Event::VoiceStateUpdate(_) => "VoiceStateUpdate",
+            Event::VoiceServerUpdate(_) => "VoiceServerUpdate",
+            Event::MessageUpdate(_) => "MessageUpdate",
+        }
+    }
+}
+
+struct Shared {
+    sequence: AtomicU64,
+    heartbeat_ack_received: AtomicBool,
+    ping_nanos: AtomicU64,
+    last_heartbeat: Mutex<Option<Instant>>,
+}
+
+impl Shared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sequence: AtomicU64::new(0),
+            heartbeat_ack_received: AtomicBool::new(true),
+            ping_nanos: AtomicU64::new(0),
+            last_heartbeat: Mutex::new(None),
+        })
+    }
+}
+
+// Owns the WebSocket sink. Drives the heartbeat timer and flushes any outbound
+// payloads posted by the handle via `outbound_rx`.
+async fn run_tx(
+    mut sink: WsSink,
+    mut outbound_rx: mpsc::Receiver<Message>,
+    heartbeat_interval_ms: u64,
+    shared: Arc<Shared>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
+    // Discard the first immediate tick so heartbeats align with the interval.
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            msg = outbound_rx.recv() => {
+                let Some(msg) = msg else {
+                    tracing::debug!("TX: outbound channel closed, shutting down");
+                    break;
+                };
+                if let Err(e) = sink.send(msg).await {
+                    tracing::warn!(error = %e, "TX: failed to send outbound message");
+                    break;
+                }
+            }
+
+            _ = interval.tick() => {
+                if !shared.heartbeat_ack_received.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        "TX: heartbeat ACK not received within interval; \
+                         connection unhealthy"
+                    );
+                    break;
+                }
+
+                shared.heartbeat_ack_received.store(false, Ordering::Relaxed);
+
+                let seq = shared.sequence.load(Ordering::Relaxed);
+                let text = match serde_json::to_string(&heartbeat_payload(seq)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "TX: failed to serialise heartbeat");
+                        break;
+                    }
+                };
+
+                tracing::debug!(seq, "TX: sending HEARTBEAT");
+                *shared.last_heartbeat.lock().await = Some(Instant::now());
+
+                if let Err(e) = sink.send(Message::Text(text.into())).await {
+                    tracing::warn!(error = %e, "TX: failed to send HEARTBEAT");
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::debug!("TX task exited");
+}
+
+
+// Owns the WebSocket source. Parses inbound frames, updates shared state for
+// control opcodes, and forwards dispatch events to the handle via `event_tx`.
+async fn run_rx(
+    mut source: WsSource,
+    event_tx: mpsc::Sender<DiscordResult<Event>>,
+    shared: Arc<Shared>,
+) {
+    loop {
+        let raw = match source.next().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "RX: WebSocket stream error");
+                let _ = event_tx.send(Err(DiscordError::WebSocket(e))).await;
+                break;
+            }
+            None => {
+                tracing::warn!("RX: WebSocket stream closed unexpectedly");
+                let _ = event_tx.send(Err(DiscordError::NotConnected)).await;
+                break;
+            }
+        };
+
+        match dispatch_raw(raw, &shared).await {
+            Ok(Some(event)) => {
+                if event_tx.send(Ok(event)).await.is_err() {
+                    tracing::debug!("RX: event channel closed, shutting down");
+                    break;
+                }
+            }
+            Ok(None) => {} // control frame — no consumer-visible event
+            Err(fatal) => {
+                let _ = event_tx.send(Err(fatal)).await;
+                break;
+            }
+        }
+    }
+
+    tracing::debug!("RX task exited");
+}
+
+/// Parse and handle a single raw WebSocket frame.
+/// Returns `Err` only for fatal conditions that should terminate the RX task.
+async fn dispatch_raw(msg: Message, shared: &Shared) -> DiscordResult<Option<Event>> {
+    let text = match msg {
+        Message::Text(t) => t,
+        Message::Close(frame) => {
+            tracing::warn!(?frame, "RX: received WebSocket close frame");
+            return Err(DiscordError::NotConnected);
+        }
+        Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {
+            return Ok(None);
+        }
+    };
+
+    let envelope: PayloadEnvelope = match serde_json::from_str(&text) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "RX: failed to parse message envelope");
+            return Ok(None);
+        }
+    };
+
+    match envelope.op {
+        OPCODE_DISPATCH => {
+            if let Some(seq) = envelope.s {
+                shared.sequence.store(seq, Ordering::Relaxed);
+            }
+
+            let event_type = match envelope.t.as_deref() {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+
+            let event = match event_type {
+                EVENT_READY => parse_dispatch::<Ready>(&text, EVENT_READY)?.map(Event::Ready),
+                EVENT_GUILD_CREATE => {
+                    parse_dispatch::<Guild>(&text, EVENT_GUILD_CREATE)?.map(Event::GuildCreate)
+                }
+                EVENT_GUILD_UPDATE => {
+                    parse_dispatch::<Guild>(&text, EVENT_GUILD_UPDATE)?.map(Event::GuildUpdate)
+                }
+                EVENT_GUILD_MEMBER_UPDATE => {
+                    parse_dispatch::<GuildMemberUpdate>(&text, EVENT_GUILD_MEMBER_UPDATE)?
+                        .map(Event::GuildMemberUpdate)
+                }
+                EVENT_MESSAGE_CREATE => {
+                    tracing::debug!("RX: MESSAGE_CREATE");
+                    parse_dispatch::<DiscordMessage>(&text, EVENT_MESSAGE_CREATE)?
+                        .map(Event::MessageCreate)
+                }
+                EVENT_MESSAGE_UPDATE => {
+                    parse_dispatch::<DiscordMessage>(&text, EVENT_MESSAGE_UPDATE)?
+                        .map(Event::MessageUpdate)
+                }
+                EVENT_VOICE_STATE_UPDATE => {
+                    parse_dispatch::<VoiceStateUpdate>(&text, EVENT_VOICE_STATE_UPDATE)?
+                        .map(Event::VoiceStateUpdate)
+                }
+                EVENT_VOICE_SERVER_UPDATE => {
+                    parse_dispatch::<VoiceServerUpdate>(&text, EVENT_VOICE_SERVER_UPDATE)?
+                        .map(Event::VoiceServerUpdate)
+                }
+                unknown => {
+                    tracing::debug!(event = unknown, "RX: ignoring unknown event type");
+                    None
+                }
+            };
+
+            Ok(event)
+        }
+
+        OPCODE_HEARTBEAT_ACK => {
+            shared.heartbeat_ack_received.store(true, Ordering::Relaxed);
+            if let Some(sent_at) = *shared.last_heartbeat.lock().await {
+                shared
+                    .ping_nanos
+                    .store(sent_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            Ok(None)
+        }
+
+        OPCODE_RECONNECT => {
+            tracing::warn!("RX: Discord requested reconnection (op 7)");
+            Err(DiscordError::Reconnect)
+        }
+
+        OPCODE_INVALID_SESSION => {
+            // `d` is a boolean: true = resumable, false = must re-IDENTIFY
+            let resumable = envelope.d
+                .as_ref()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            tracing::warn!(resumable, "RX: INVALID_SESSION (op 9)");
+            sleep(Duration::from_secs(INVALID_SESSION_RETRY_SECS)).await;
+            Err(DiscordError::InvalidSession(resumable))
+        }
+
+        OPCODE_HELLO => {
+            tracing::debug!("RX: HELLO received after initial connection");
+            Ok(None)
+        }
+
+        unknown => {
+            tracing::debug!(op = unknown, "RX: unknown opcode");
+            Ok(None)
+        }
+    }
+}
+
+/// Parses a DISPATCH payload (op 0) into the specified event type.
+/// Returns `Ok(None)` if parsing fails (non-fatal).
+fn parse_dispatch<T: DeserializeOwned>(
+    text: &str,
+    event_type: &'static str,
+) -> DiscordResult<Option<T>> {
+    match serde_json::from_str::<Payload<T>>(text) {
+        Ok(p) => Ok(p.d),
+        Err(e) => {
+            tracing::warn!(error = %e, event = event_type, "RX: failed to parse dispatch payload");
+            Ok(None)
+        }
+    }
+}
+
+/// A lightweight, cheaply-cloneable handle for sending payloads to the Discord
+/// gateway.  Obtained from [`DiscordWebsocket::gateway_sender`] after the
+/// initial connection handshake completes.
+#[derive(Clone)]
+pub struct GatewaySender {
+    tx: mpsc::Sender<Message>,
+}
+
+impl GatewaySender {
+    /// Serializes and sends a payload to the Discord gateway.
+    pub async fn send_payload(&self, payload: &impl Serialize) -> DiscordResult<()> {
+        let text = serde_json::to_string(payload).map_err(DiscordError::Json)?;
+        self.tx
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|_| DiscordError::NotConnected)
+    }
+
+    /// Sends a raw JSON value to the Discord gateway.
+    pub async fn send_raw(&self, value: serde_json::Value) -> DiscordResult<()> {
+        self.send_payload(&value).await
+    }
+
+    /// Sends a VOICE_STATE_UPDATE (op 4) to join or leave a voice channel.
+    /// Pass `None` for `channel_id` to leave.
+    pub async fn update_voice_state(
+        &self,
+        guild_id: &Id,
+        channel_id: Option<&Id>,
+        self_mute: bool,
+        self_deaf: bool,
+    ) -> DiscordResult<()> {
+        self.send_payload(&Payload {
+            op: OPCODE_VOICE_STATE_UPDATE,
+            d: Some(VoiceStateUpdateOutgoing {
+                guild_id: *guild_id,
+                channel_id: channel_id.copied(),
+                self_mute,
+                self_deaf,
+            }),
+            s: None,
+            t: None,
+        })
+        .await
+    }
 }
 
 pub struct DiscordWebsocket {
     token: Cow<'static, str>,
-    socket: WsStream,
-    heartbeat_interval: Interval,
-    sequence: u64,
     shard_config: ShardConfig,
     session_id: Option<String>,
-    heartbeat_ack_received: Arc<AtomicBool>,
-    last_heartbeat: Option<Instant>,
-    ping_nanos: Arc<AtomicU64>,
+    resume_gateway_url: Option<String>,
+
+    /// Raw socket used during the HELLO/IDENTIFY handshake (before tasks spawn).
+    pre_spawn_socket: Option<WsStream>,
+    /// Heartbeat interval received from HELLO; passed to the TX task on spawn.
+    heartbeat_interval_ms: u64,
+    /// Sequence number to seed into Shared when spawning tasks.
+    /// Non-zero when resuming a previous session.
+    initial_seq: u64,
+
+    /// Post-spawn: channel to the TX task.
+    outbound_tx: Option<mpsc::Sender<Message>>,
+    /// Post-spawn: channel from the RX task.
+    event_rx: Option<mpsc::Receiver<DiscordResult<Event>>>,
+
+    /// Shared atomic state — also accessible post-spawn.
+    shared: Option<Arc<Shared>>,
+
+    /// Caller-supplied latch updated each `next_event` call.
+    ping_nanos_out: Arc<AtomicU64>,
+}
+
+/// State required to RESUME a previously established gateway session.
+///
+/// Extract from a disconnected [`DiscordWebsocket`] via [`DiscordWebsocket::resume_state`]
+/// and pass to the next [`DiscordWebsocket::connect`] call.
+#[derive(Debug, Clone)]
+pub struct ResumeState {
+    pub session_id: String,
+    pub resume_gateway_url: String,
+    pub seq: u64,
 }
 
 impl DiscordWebsocket {
-    #[instrument(skip(rest, token), fields(shard_id = shard_config.shard_id, num_shards = shard_config.num_shards))]
+    /// Connects to the Discord gateway WebSocket.
+    ///
+    /// If `resume` is `Some`, connects to the `resume_gateway_url` and prepares
+    /// for RESUME (op 6).  Otherwise fetches the gateway URL from REST and
+    /// prepares for IDENTIFY (op 2).
+    #[instrument(skip(rest, token, resume), fields(shard_id = shard_config.shard_id, num_shards = shard_config.num_shards))]
     pub async fn connect(
         rest: Arc<DiscordRestClient>,
         token: &str,
         shard_config: ShardConfig,
         ping_nanos: Arc<AtomicU64>,
+        resume: Option<ResumeState>,
     ) -> DiscordResult<Self> {
-        tracing::info!("Initiating WebSocket connection");
+        let (session_id, resume_gateway_url, resume_seq, gateway_url) = if let Some(r) = resume {
+            tracing::info!(
+                resume_url = %r.resume_gateway_url,
+                seq = r.seq,
+                "attempting RESUME"
+            );
+            let url = r.resume_gateway_url.clone();
+            (Some(r.session_id), Some(r.resume_gateway_url), r.seq, url)
+        } else {
+            tracing::info!("Initiating fresh WebSocket connection");
+            let gateway = rest.get_gateway().await.map_err(|e| {
+                tracing::error!(error = %e, "Failed to fetch Discord gateway URL");
+                DiscordError::ConnectionFailed("Failed to connect to Discord gateway".into())
+            })?;
+            tracing::debug!(gateway_url = %gateway.url, "Retrieved gateway URL");
+            (None, None, 0, gateway.url)
+        };
 
-        let gateway = rest.get_gateway().await?;
-        tracing::debug!(gateway_url = %gateway.url, "Retrieved gateway URL");
-
-        let (socket, response) = connect_async(&gateway.url)
-            .await
-            .map_err(DiscordError::WebSocket)?;
+        let (socket, response) = connect_async(&gateway_url).await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to establish WebSocket connection");
+            DiscordError::ConnectionFailed("Failed to connect to Discord gateway".into())
+        })?;
 
         tracing::info!(
             status = response.status().as_u16(),
             "WebSocket connection established"
         );
 
-        let trimmed_token = token.trim().to_string();
-        let token = Cow::Owned(trimmed_token);
+        // When resuming, seed the shared sequence counter with the last known
+        // value so the RESUME payload and heartbeats carry the correct seq.
+        let initial_seq = if session_id.is_some() { resume_seq } else { 0 };
 
-        let discord = DiscordWebsocket {
-            token,
-            socket,
-            heartbeat_interval: tokio::time::interval(Duration::from_secs(45)),
-            sequence: 0,
+        Ok(Self {
+            token: Cow::Owned(token.trim().to_string()),
             shard_config,
-            session_id: None,
-            heartbeat_ack_received: Arc::new(AtomicBool::new(true)),
-            last_heartbeat: None,
-            ping_nanos,
-        };
-
-        Ok(discord)
+            session_id,
+            resume_gateway_url,
+            pre_spawn_socket: Some(socket),
+            heartbeat_interval_ms: 45_000,
+            initial_seq,
+            outbound_tx: None,
+            event_rx: None,
+            shared: None,
+            ping_nanos_out: ping_nanos,
+        })
     }
 
+    /// Performs the HELLO / HEARTBEAT / IDENTIFY (or RESUME) handshake on the
+    /// raw socket, then splits it and spawns the independent RX and TX tasks.
+    ///
+    /// After this returns, all sends go through `outbound_tx` and all events
+    /// arrive from `event_rx`.
     #[instrument(skip(self))]
     pub async fn handle_initial_connection(&mut self) -> DiscordResult<()> {
-        let hello: Payload<Hello> = {
-            let msg = self
-                .socket
-                .next()
-                .await
-                .ok_or_else(|| DiscordError::NotConnected)?
-                .map_err(DiscordError::WebSocket)?;
-            let text = msg.into_text().map_err(DiscordError::WebSocket)?;
-            serde_json::from_str(&text)?
+        // recv HELLO
+        let hello_text = {
+            let socket = self
+                .pre_spawn_socket
+                .as_mut()
+                .ok_or_else(|| DiscordError::ConnectionFailed("Tasks already spawned".into()))?;
+            receive_one(socket, "HELLO").await?
         };
 
-        self.heartbeat_interval = tokio::time::interval(Duration::from_millis(
-            hello
-                .d
+        let hello: Payload<Hello> = serde_json::from_str(&hello_text).map_err(|e| {
+            tracing::warn!(error = %e, "Failed to parse HELLO payload");
+            DiscordError::InvalidPayload("Invalid gateway payload".into())
+        })?;
+
+        let interval_ms = hello
+            .d
+            .as_ref()
+            .ok_or_else(|| DiscordError::InvalidPayload("HELLO missing d field".into()))?
+            .heartbeat_interval;
+        self.heartbeat_interval_ms = interval_ms;
+
+        tracing::debug!(heartbeat_ms = interval_ms, "Received HELLO");
+
+        // Send initial HEARTBEAT
+
+        self.send_payload(&Payload::<u64> {
+            op: OPCODE_HEARTBEAT,
+            d: Some(0),
+            s: None,
+            t: None,
+        })
+        .await?;
+
+        // Send IDENTIFY or RESUME
+        if let Some(session_id) = self.session_id.clone() {
+            // Use the last received sequence number for RESUME.
+            let seq = self
+                .shared
                 .as_ref()
-                .ok_or_else(|| DiscordError::InvalidPayload("Hello missing d field".to_string()))?
-                .heartbeat_interval,
+                .map(|s| s.sequence.load(Ordering::Relaxed))
+                .unwrap_or(0);
+
+            self.send_payload(&Payload {
+                op: OPCODE_RESUME,
+                d: Some(Resume {
+                    token: self.token.clone(),
+                    session_id,
+                    seq,
+                }),
+                s: None,
+                t: None,
+            })
+            .await?;
+
+            tracing::info!(seq, "Sent RESUME");
+        } else {
+            self.send_payload(&Payload {
+                op: OPCODE_IDENTIFY,
+                d: Some(Identify {
+                    token: self.token.clone(),
+                    properties: ConnectionProperties::new(),
+                    intents: Intents::all(),
+                    shard: self.shard_config.to_array(),
+                }),
+                s: None,
+                t: None,
+            })
+            .await?;
+
+            tracing::info!(
+                shard_id = self.shard_config.shard_id,
+                num_shards = self.shard_config.num_shards,
+                "Sent IDENTIFY"
+            );
+        }
+
+        // Spawn RX and TX tasks, handing off the socket and shared state
+        let socket = self.pre_spawn_socket.take().expect("set above");
+        let (sink, source) = socket.split();
+
+        let shared = Shared::new();
+
+        // Seed the shared sequence counter when resuming so heartbeats
+        // carry the correct seq and the INVALID_SESSION check can extract
+        // the right value.
+        if self.initial_seq > 0 {
+            shared
+                .sequence
+                .store(self.initial_seq, Ordering::Relaxed);
+        }
+
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<DiscordResult<Event>>(CHANNEL_CAPACITY);
+
+        tokio::spawn(run_tx(
+            sink,
+            outbound_rx,
+            self.heartbeat_interval_ms,
+            Arc::clone(&shared),
         ));
 
-        self.send_heartbeat().await?;
+        tokio::spawn(run_rx(source, event_tx, Arc::clone(&shared)));
 
-        if let Some(session_id) = &self.session_id {
-            self.resume(session_id.clone()).await?;
-        } else {
-            self.identify().await?;
-        }
+        self.outbound_tx = Some(outbound_tx);
+        self.event_rx = Some(event_rx);
+        self.shared = Some(shared);
 
-        Ok(())
-    }
-
-    pub async fn next_event(&mut self) -> DiscordResult<Option<Event>> {
-        loop {
-            if let Some(last_heartbeat) = self.last_heartbeat {
-                if !self.heartbeat_ack_received.load(Ordering::Relaxed)
-                    && last_heartbeat.elapsed() > Duration::from_secs(15)
-                {
-                    tracing::warn!("Heartbeat ACK not received within 15 seconds, connection unhealthy");
-                    return Err(DiscordError::NotConnected);
-                }
-            }
-
-            tokio::select! {
-                _ = self.heartbeat_interval.tick() => {
-                    if !self.heartbeat_ack_received.load(Ordering::Relaxed) {
-                        tracing::warn!("Previous heartbeat ACK not received, connection may be unhealthy");
-                        return Err(DiscordError::NotConnected);
-                    }
-                    self.heartbeat_ack_received.store(false, Ordering::Relaxed);
-                    if let Err(e) = self.send_heartbeat().await {
-                        tracing::warn!("Failed to send heartbeat: {:?}", e);
-                        return Err(e);
-                    }
-                    self.last_heartbeat = Some(Instant::now());
-                },
-                msg = self.socket.next() => {
-                    match msg {
-                        Some(Ok(msg)) => {
-                            match self.handle_message(msg).await {
-                                Ok(Some(event)) => return Ok(Some(event)),
-                                Ok(None) => continue,
-                                Err(e) => {
-                                    tracing::warn!("Error handling WebSocket message: {:?}", e);
-                                    return Err(e);
-                                }
-                            }
-                        },
-                        Some(Err(e)) => {
-                            tracing::warn!("WebSocket error: {:?}", e);
-                            return Err(DiscordError::WebSocket(e));
-                        },
-                        None => {
-                            tracing::warn!("WebSocket stream closed unexpectedly");
-                            return Err(DiscordError::NotConnected);
-                        },
-                    }
-                },
-            }
-        }
-    }
-
-    async fn handle_message(&mut self, msg: Message) -> DiscordResult<Option<Event>> {
-        let text = match msg {
-            Message::Text(text) => text,
-            Message::Close(close_frame) => {
-                tracing::warn!("Received WebSocket close frame: {:?}", close_frame);
-                return Err(DiscordError::NotConnected);
-            }
-            Message::Ping(_) => {
-                return Ok(None);
-            }
-            Message::Pong(_) => {
-                return Ok(None);
-            }
-            _ => {
-                return Ok(None);
-            }
-        };
-
-        let envelope: PayloadEnvelope = match serde_json::from_str(&text) {
-            Ok(envelope) => envelope,
-            Err(e) => {
-                tracing::warn!("Failed to parse WebSocket message envelope: {} (message: {})", e, text.chars().take(100).collect::<String>());
-                return Ok(None);
-            }
-        };
-
-        match envelope.op {
-            OPCODE_DISPATCH => {
-                if let Some(seq) = envelope.s {
-                    self.sequence = seq;
-                }
-
-                if let Some(event_type) = envelope.t.as_ref() {
-                    match event_type.as_str() {
-                        EVENT_READY => {
-                            if let Ok(payload) = serde_json::from_str::<Payload<Ready>>(&text) {
-                                if let Some(ready) = payload.d {
-                                    self.session_id = ready.session_id.clone();
-                                    tracing::info!("Bot ready with session ID: {:?}", self.session_id);
-                                    return Ok(Some(Event::Ready(ready)));
-                                }
-                            }
-                        }
-                        EVENT_GUILD_CREATE => {
-                            if let Ok(payload) = serde_json::from_str::<Payload<Guild>>(&text) {
-                                if let Some(guild) = payload.d {
-                                    return Ok(Some(Event::GuildCreate(guild)));
-                                }
-                            }
-                        }
-                        EVENT_GUILD_UPDATE => {
-                            if let Ok(payload) = serde_json::from_str::<Payload<Guild>>(&text) {
-                                if let Some(guild) = payload.d {
-                                    return Ok(Some(Event::GuildUpdate(guild)));
-                                }
-                            }
-                        }
-                        EVENT_GUILD_MEMBER_UPDATE => {
-                            if let Ok(payload) = serde_json::from_str::<Payload<GuildMemberUpdate>>(&text) {
-                                if let Some(member_update) = payload.d {
-                                    return Ok(Some(Event::GuildMemberUpdate(member_update)));
-                                }
-                            }
-                        }
-                        EVENT_MESSAGE_CREATE => {
-                            if let Ok(payload) = serde_json::from_str::<Payload<DiscordMessage>>(&text) {
-                                if let Some(message) = payload.d {
-                                    return Ok(Some(Event::MessageCreate(message)));
-                                }
-                            }
-                        }
-                        EVENT_MESSAGE_UPDATE => {
-                            if let Ok(payload) = serde_json::from_str::<Payload<DiscordMessage>>(&text) {
-                                if let Some(message) = payload.d {
-                                    return Ok(Some(Event::MessageUpdate(message)));
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::debug!("Ignoring unknown event type: {}", event_type);
-                        }
-                    }
-                }
-            }
-            OPCODE_HEARTBEAT_ACK => {
-                self.heartbeat_ack_received.store(true, Ordering::Relaxed);
-                if let Some(last_hb) = self.last_heartbeat {
-                    let ping_nanos = last_hb.elapsed().as_nanos() as u64;
-                    self.ping_nanos.store(ping_nanos, Ordering::Relaxed);
-                }
-            }
-            OPCODE_RECONNECT => {
-                tracing::warn!("Discord requested reconnection");
-                return Err(DiscordError::NotConnected);
-            }
-            OPCODE_INVALID_SESSION => {
-                tracing::warn!("Discord sent invalid session, clearing session ID and reconnecting");
-                self.session_id = None;
-                sleep(Duration::from_secs(5)).await;
-                return Err(DiscordError::NotConnected);
-            }
-            OPCODE_HELLO => {
-                tracing::debug!("Received HELLO opcode after initial connection");
-            }
-            _ => {
-                tracing::debug!("Received unknown opcode: {}", envelope.op);
-            }
-        }
-
-        Ok(None)
-    }
-
-    pub async fn send_payload<T: Serialize>(
-        &mut self,
-        payload: &Payload<T>,
-    ) -> DiscordResult<()> {
-        let msg_text = serde_json::to_string(payload).map_err(DiscordError::Json)?;
-        let msg = Message::Text(msg_text.into());
-
-        self.socket
-            .send(msg)
-            .await
-            .map_err(DiscordError::WebSocket)?;
-
-        Ok(())
-    }
-
-    pub async fn send_heartbeat(&mut self) -> DiscordResult<()> {
-        let payload = Payload {
-            op: OPCODE_HEARTBEAT,
-            d: Some(self.sequence),
-            s: None,
-            t: None,
-        };
-
-        tracing::debug!(
-            shard_id = self.shard_config.shard_id,
-            seq = self.sequence,
-            "Sending HEARTBEAT payload"
-        );
-
-        self.send_payload(&payload).await?;
-
-        Ok(())
-    }
-
-    async fn identify(&mut self) -> DiscordResult<()> {
-        let identify = Identify {
-            token: self.token.clone(),
-            properties: ConnectionProperties::new(),
-            intents: Intents::all(),
-            shard: self.shard_config.to_array(),
-        };
-
-        let payload = Payload {
-            op: OPCODE_IDENTIFY,
-            d: Some(identify),
-            s: None,
-            t: None,
-        };
         tracing::info!(
             shard_id = self.shard_config.shard_id,
-            num_shards = self.shard_config.num_shards,
-            token = self.token.as_ref(),
-            "Sending IDENTIFY payload"
+            heartbeat_ms = interval_ms,
+            "RX and TX tasks spawned"
         );
-        self.send_payload(&payload).await
+
+        Ok(())
     }
 
-    async fn resume(&mut self, session_id: String) -> DiscordResult<()> {
-        let resume = serde_json::json!({
-            "token": self.token,
-            "session_id": session_id,
-            "seq": self.sequence
-        });
+    /// Receives the next event from the gateway.
+    /// Returns `Ok(None)` if the RX task exited.
+    pub async fn next_event(&mut self) -> DiscordResult<Option<Event>> {
+        let rx = self
+            .event_rx
+            .as_mut()
+            .ok_or_else(|| DiscordError::NotConnected)?;
 
-        let payload = Payload {
-            op: OPCODE_RESUME,
-            d: Some(resume),
+        if let Some(shared) = &self.shared {
+            self.ping_nanos_out
+                .store(shared.ping_nanos.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+
+        match rx.recv().await {
+            Some(Ok(event)) => {
+                if let Event::Ready(ref r) = event {
+                    self.session_id = r.session_id.clone();
+                    self.resume_gateway_url = r.resume_gateway_url.clone();
+                    tracing::info!(
+                        has_session = self.session_id.is_some(),
+                        resume_url = ?self.resume_gateway_url,
+                        "Bot READY",
+                    );
+                }
+                Ok(Some(event))
+            }
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Sends a serialized payload to the gateway.
+    pub async fn send_payload(&mut self, payload: &impl Serialize) -> DiscordResult<()> {
+        let text = serde_json::to_string(payload).map_err(DiscordError::Json)?;
+        self.enqueue(Message::Text(text.into())).await
+    }
+
+    /// Sends a raw JSON value to the gateway.
+    pub async fn send_raw(&mut self, value: serde_json::Value) -> DiscordResult<()> {
+        self.send_payload(&value).await
+    }
+
+    /// Manually sends a HEARTBEAT (op 1) with the current sequence number.
+    pub async fn send_heartbeat(&mut self) -> DiscordResult<()> {
+        let seq = self
+            .shared
+            .as_ref()
+            .map(|s| s.sequence.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        self.send_payload(&Payload::<u64> {
+            op: OPCODE_HEARTBEAT,
+            d: Some(seq),
             s: None,
             t: None,
-        };
-        self.send_payload(&payload).await
+        })
+        .await
     }
 
+    /// Sends a VOICE_STATE_UPDATE (op 4) to join or leave a voice channel.
+    /// Pass `None` for `channel_id` to leave the current voice channel.
+    pub async fn update_voice_state(
+        &mut self,
+        guild_id: &Id,
+        channel_id: Option<&Id>,
+        self_mute: bool,
+        self_deaf: bool,
+    ) -> DiscordResult<()> {
+        self.send_payload(&Payload {
+            op: OPCODE_VOICE_STATE_UPDATE,
+            d: Some(VoiceStateUpdateOutgoing {
+                guild_id: *guild_id,
+                channel_id: channel_id.copied(),
+                self_mute,
+                self_deaf,
+            }),
+            s: None,
+            t: None,
+        })
+        .await
+    }
+
+    async fn enqueue(&mut self, msg: Message) -> DiscordResult<()> {
+        if let Some(tx) = &self.outbound_tx {
+            tx.send(msg).await.map_err(|_| {
+                tracing::warn!("Outbound TX channel closed");
+                DiscordError::NotConnected
+            })
+        } else if let Some(socket) = &mut self.pre_spawn_socket {
+            socket.send(msg).await.map_err(|e| {
+                tracing::warn!(error = %e, "Failed to send on pre-spawn socket");
+                DiscordError::ConnectionFailed("Failed to send gateway payload".into())
+            })
+        } else {
+            Err(DiscordError::NotConnected)
+        }
+    }
+
+    /// Returns a [`GatewaySender`] that can send payloads to the gateway from
+    /// any task without needing `&mut self` or access to this struct.
+    /// Returns `None` if called before [`handle_initial_connection`].
+    pub fn gateway_sender(&self) -> Option<GatewaySender> {
+        self.outbound_tx.clone().map(|tx| GatewaySender { tx })
+    }
+
+    /// Returns the last measured gateway round-trip ping.
     pub fn ping(&self) -> Duration {
-        Duration::from_nanos(self.ping_nanos.load(Ordering::Relaxed))
+        Duration::from_nanos(self.ping_nanos_out.load(Ordering::Relaxed))
     }
 
-    pub fn is_healthy(&self) -> bool {
-        self.heartbeat_ack_received.load(Ordering::Relaxed)
+    /// Returns a snapshot of the resume state for this session, if available.
+    /// Used to carry `session_id`, `resume_gateway_url`, and `seq` across
+    /// reconnection attempts so a RESUME can be sent instead of a full IDENTIFY.
+    pub fn resume_state(&self) -> Option<ResumeState> {
+        let session_id = self.session_id.clone()?;
+        let resume_gateway_url = self.resume_gateway_url.clone()?;
+        let seq = self
+            .shared
+            .as_ref()
+            .map(|s| s.sequence.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        Some(ResumeState {
+            session_id,
+            resume_gateway_url,
+            seq,
+        })
     }
+
+    /// Returns `true` if the last heartbeat was acknowledged (connection is healthy).
+    pub fn is_healthy(&self) -> bool {
+        self.shared
+            .as_ref()
+            .map(|s| s.heartbeat_ack_received.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+}
+
+/// Reads a single text frame from the socket (used before tasks are spawned).
+/// Ignores ping/pong frames and returns the first text message.
+async fn receive_one(socket: &mut WsStream, context: &'static str) -> DiscordResult<String> {
+    loop {
+        match socket.next().await {
+            None => {
+                tracing::warn!(context, "Socket closed before expected payload");
+                return Err(DiscordError::NotConnected);
+            }
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, context, "WebSocket error during handshake");
+                return Err(DiscordError::ConnectionFailed(
+                    "Gateway initialization failed".into(),
+                ));
+            }
+            Some(Ok(Message::Text(t))) => return Ok(t.to_string()),
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(_)) => {
+                return Err(DiscordError::InvalidPayload(
+                    "Non-text payload during handshake".into(),
+                ));
+            }
+        }
+    }
+}
+
+/// Constructs a HEARTBEAT payload (op 1) with the given sequence number.
+fn heartbeat_payload(seq: u64) -> serde_json::Value {
+    serde_json::json!({ "op": OPCODE_HEARTBEAT, "d": seq })
 }

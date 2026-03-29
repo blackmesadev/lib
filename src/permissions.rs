@@ -468,7 +468,7 @@ impl PermissionSet {
         set
     }
 
-    pub fn iter(&self) -> std::collections::hash_set::Iter<Permission> {
+    pub fn iter(&self) -> std::collections::hash_set::Iter<'_, Permission> {
         self.permissions.iter()
     }
 }

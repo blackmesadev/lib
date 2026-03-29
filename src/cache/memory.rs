@@ -92,9 +92,7 @@ impl CacheBackend for MemoryCache {
                 let value: V = serde_json::from_slice(&entry.data)?;
                 Ok(Some(value))
             }
-            None => {
-                Ok(None)
-            }
+            None => Ok(None),
         };
 
         result
@@ -277,5 +275,9 @@ impl CacheBackend for MemoryCache {
         } else {
             Ok(false)
         }
+    }
+
+    async fn ping(&self) -> Result<bool, Self::Error> {
+        Ok(true)
     }
 }

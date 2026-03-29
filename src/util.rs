@@ -2,6 +2,10 @@ use std::time::SystemTime;
 
 use crate::discord::{Id, DISCORD_EPOCH};
 
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+
 pub fn max_snowflake_now() -> u64 {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -16,26 +20,30 @@ pub fn format_duration(duration: u64) -> String {
     let mut duration = duration;
     let mut result = String::new();
 
-    let days = duration / 86400;
+    let days = duration / SECONDS_PER_DAY;
     if days > 0 {
         result.push_str(&format!("{}d", days));
-        duration %= 86400;
+        duration %= SECONDS_PER_DAY;
     }
 
-    let hours = duration / 3600;
+    let hours = duration / SECONDS_PER_HOUR;
     if hours > 0 {
         result.push_str(&format!("{}h", hours));
-        duration %= 3600;
+        duration %= SECONDS_PER_HOUR;
     }
 
-    let minutes = duration / 60;
+    let minutes = duration / SECONDS_PER_MINUTE;
     if minutes > 0 {
         result.push_str(&format!("{}m", minutes));
-        duration %= 60;
+        duration %= SECONDS_PER_MINUTE;
     }
 
     if duration > 0 {
         result.push_str(&format!("{}s", duration));
+    }
+
+    if result.is_empty() {
+        result.push_str("0s");
     }
 
     result
