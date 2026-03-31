@@ -1,8 +1,15 @@
 use super::Database;
+use sqlx::Row;
 
 use tracing::instrument;
 
-use crate::{discord::Id, model::Config};
+use crate::{
+    discord::Id,
+    model::{
+        config::Config,
+        permissions::{PermissionGroup, PermissionSet},
+    },
+};
 
 pub use super::DbError;
 
@@ -30,44 +37,29 @@ impl Database {
     pub async fn get_config(&self, guild_id: &Id) -> Result<Option<Config>, DbError> {
         let guild_id_i64 = guild_id.get() as i64;
 
-        let row = sqlx::query_as::<_, ConfigRow>(
-            r#"SELECT
-                   id,
-                   prefix,
-                   mute_role,
-                   default_warn_duration,
-                   log_channel,
-                   prefer_embeds,
-                   inherit_discord_perms,
-                   alert_on_infraction,
-                   send_permission_denied,
-                   permission_groups,
-                   automod,
-                   command_aliases
-               FROM configs
-               WHERE id = $1"#,
+        let config_fut = sqlx::query_as::<_, Config>("SELECT * FROM configs WHERE id = $1")
+            .bind(guild_id_i64)
+            .fetch_optional(&self.pool);
+
+        let groups_fut = sqlx::query_as::<_, PermissionGroup>(
+            "SELECT name, permissions, roles, users FROM permissions WHERE guild_id = $1 ORDER BY id",
         )
         .bind(guild_id_i64)
-        .fetch_optional(&self.pool)
-        .await?;
+        .fetch_all(&self.pool);
 
-        match row {
-            None => Ok(None),
-            Some(row) => Ok(Some(Config {
-                id: Id::new(row.id as u64),
-                prefix: row.prefix,
-                mute_role: row.mute_role.map(|v| Id::new(v as u64)),
-                default_warn_duration: row.default_warn_duration.map(|v| v as u64),
-                log_channel: row.log_channel.map(|v| Id::new(v as u64)),
-                prefer_embeds: row.prefer_embeds,
-                inherit_discord_perms: row.inherit_discord_perms,
-                alert_on_infraction: row.alert_on_infraction,
-                send_permission_denied: row.send_permission_denied,
-                permission_groups: parse_json_opt(row.permission_groups, "permission_groups")?,
-                automod: parse_json_opt(row.automod, "automod")?,
-                command_aliases: parse_json_opt(row.command_aliases, "command_aliases")?,
-            })),
-        }
+        let (config, groups) = tokio::try_join!(config_fut, groups_fut)?;
+
+        let Some(mut config) = config else {
+            return Ok(None);
+        };
+
+        config.permission_groups = if groups.is_empty() {
+            None
+        } else {
+            Some(groups)
+        };
+
+        Ok(Some(config))
     }
 
     #[instrument(
@@ -78,12 +70,10 @@ impl Database {
         )
     )]
     pub async fn update_config(&self, guild_id: &Id, config: &Config) -> Result<Config, DbError> {
-        let guild_id_i64 = guild_id.get() as i64;
-        let permission_groups = to_json_opt(&config.permission_groups, "permission_groups")?;
-        let automod = to_json_opt(&config.automod, "automod")?;
-        let command_aliases = to_json_opt(&config.command_aliases, "command_aliases")?;
+        let command_aliases = to_json_opt(&config.command_aliases)?;
+        let automod = to_json_opt(&config.automod)?;
 
-        let row = sqlx::query_as::<_, ConfigRow>(
+        sqlx::query(
             r#"UPDATE configs
                SET
                    prefix = $2,
@@ -94,25 +84,14 @@ impl Database {
                    inherit_discord_perms = $7,
                    alert_on_infraction = $8,
                    send_permission_denied = $9,
-                   permission_groups = $10,
+                   command_aliases = $10,
                    automod = $11,
-                   command_aliases = $12
-               WHERE id = $1
-               RETURNING
-                   id,
-                   prefix,
-                   mute_role,
-                   default_warn_duration,
-                   log_channel,
-                   prefer_embeds,
-                   inherit_discord_perms,
-                   alert_on_infraction,
-                   send_permission_denied,
-                   permission_groups,
-                   automod,
-                   command_aliases"#,
+                   automod_enabled = $12,
+                   music_enabled = $13,
+                   moderation_enabled = $14
+               WHERE id = $1"#,
         )
-        .bind(guild_id_i64)
+        .bind(guild_id.get() as i64)
         .bind(&config.prefix)
         .bind(config.mute_role.map(|v| v.get() as i64))
         .bind(config.default_warn_duration.map(|v| v as i64))
@@ -121,26 +100,18 @@ impl Database {
         .bind(config.inherit_discord_perms)
         .bind(config.alert_on_infraction)
         .bind(config.send_permission_denied)
-        .bind(permission_groups)
-        .bind(automod)
         .bind(command_aliases)
-        .fetch_one(&self.pool)
+        .bind(automod)
+        .bind(config.automod_enabled)
+        .bind(config.music_enabled)
+        .bind(config.moderation_enabled)
+        .execute(&self.pool)
         .await?;
 
-        Ok(Config {
-            id: Id::new(row.id as u64),
-            prefix: row.prefix,
-            mute_role: row.mute_role.map(|v| Id::new(v as u64)),
-            default_warn_duration: row.default_warn_duration.map(|v| v as u64),
-            log_channel: row.log_channel.map(|v| Id::new(v as u64)),
-            prefer_embeds: row.prefer_embeds,
-            inherit_discord_perms: row.inherit_discord_perms,
-            alert_on_infraction: row.alert_on_infraction,
-            send_permission_denied: row.send_permission_denied,
-            permission_groups: parse_json_opt(row.permission_groups, "permission_groups")?,
-            automod: parse_json_opt(row.automod, "automod")?,
-            command_aliases: parse_json_opt(row.command_aliases, "command_aliases")?,
-        })
+        self.sync_permission_groups(guild_id, &config.permission_groups)
+            .await?;
+
+        Ok(config.clone())
     }
 
     #[instrument(
@@ -151,43 +122,20 @@ impl Database {
         )
     )]
     pub async fn create_config(&self, config: &Config) -> Result<Config, DbError> {
-        let guild_id_i64 = config.id.get() as i64;
-        let permission_groups = to_json_opt(&config.permission_groups, "permission_groups")?;
-        let automod = to_json_opt(&config.automod, "automod")?;
-        let command_aliases = to_json_opt(&config.command_aliases, "command_aliases")?;
+        let command_aliases = to_json_opt(&config.command_aliases)?;
+        let automod = to_json_opt(&config.automod)?;
 
-        let row = sqlx::query_as::<_, ConfigRow>(
+        sqlx::query(
             r#"INSERT INTO configs (
-                   id,
-                   prefix,
-                   mute_role,
-                   default_warn_duration,
-                   log_channel,
-                   prefer_embeds,
-                   inherit_discord_perms,
-                   alert_on_infraction,
-                   send_permission_denied,
-                   permission_groups,
-                   automod,
-                   command_aliases
+                   id, prefix, mute_role, default_warn_duration, log_channel,
+                   prefer_embeds, inherit_discord_perms, alert_on_infraction,
+                   send_permission_denied, command_aliases, automod,
+                   automod_enabled, music_enabled, moderation_enabled
                ) VALUES (
-                   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-               )
-               RETURNING
-                   id,
-                   prefix,
-                   mute_role,
-                   default_warn_duration,
-                   log_channel,
-                   prefer_embeds,
-                   inherit_discord_perms,
-                   alert_on_infraction,
-                   send_permission_denied,
-                   permission_groups,
-                   automod,
-                   command_aliases"#,
+                   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+               )"#,
         )
-        .bind(guild_id_i64)
+        .bind(config.id.get() as i64)
         .bind(&config.prefix)
         .bind(config.mute_role.map(|v| v.get() as i64))
         .bind(config.default_warn_duration.map(|v| v as i64))
@@ -196,66 +144,182 @@ impl Database {
         .bind(config.inherit_discord_perms)
         .bind(config.alert_on_infraction)
         .bind(config.send_permission_denied)
-        .bind(permission_groups)
-        .bind(automod)
         .bind(command_aliases)
-        .fetch_one(&self.pool)
+        .bind(automod)
+        .bind(config.automod_enabled)
+        .bind(config.music_enabled)
+        .bind(config.moderation_enabled)
+        .execute(&self.pool)
         .await?;
 
-        Ok(Config {
-            id: Id::new(row.id as u64),
-            prefix: row.prefix,
-            mute_role: row.mute_role.map(|v| Id::new(v as u64)),
-            default_warn_duration: row.default_warn_duration.map(|v| v as u64),
-            log_channel: row.log_channel.map(|v| Id::new(v as u64)),
-            prefer_embeds: row.prefer_embeds,
-            inherit_discord_perms: row.inherit_discord_perms,
-            alert_on_infraction: row.alert_on_infraction,
-            send_permission_denied: row.send_permission_denied,
-            permission_groups: parse_json_opt(row.permission_groups, "permission_groups")?,
-            automod: parse_json_opt(row.automod, "automod")?,
-            command_aliases: parse_json_opt(row.command_aliases, "command_aliases")?,
+        if let Some(groups) = &config.permission_groups {
+            self.insert_permission_groups(&config.id, groups).await?;
+        }
+
+        Ok(config.clone())
+    }
+
+    async fn sync_permission_groups(
+        &self,
+        guild_id: &Id,
+        groups: &Option<Vec<PermissionGroup>>,
+    ) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM permissions WHERE guild_id = $1")
+            .bind(guild_id.get() as i64)
+            .execute(&self.pool)
+            .await?;
+
+        if let Some(groups) = groups {
+            self.insert_permission_groups(guild_id, groups).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn list_guilds_for_user(
+        &self,
+        user_id: &Id,
+        user_guild_ids: &[Id],
+        user_role_ids: &[Id],
+        permission: PermissionSet,
+    ) -> Result<Vec<Id>, DbError> {
+        let guild_ids: Vec<i64> = user_guild_ids.iter().map(|id| id.get() as i64).collect();
+        let role_ids: Vec<i64> = user_role_ids.iter().map(|id| id.get() as i64).collect();
+
+        // When we know the exact guilds the user is a member of, bound the scan to
+        // those guilds so Postgres avoids a full permissions-table sweep.
+        let rows = if guild_ids.is_empty() {
+            // Fallback: no cached guild membership — only direct user-id matches.
+            sqlx::query_scalar::<_, i64>(
+                "SELECT DISTINCT guild_id FROM permissions \
+                 WHERE $1 = ANY(users) \
+                 AND (permissions & $2) != 0",
+            )
+            .bind(user_id.get() as i64)
+            .bind(permission.bits() as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT DISTINCT guild_id FROM permissions \
+                 WHERE guild_id = ANY($4) \
+                 AND ($1 = ANY(users) OR roles && $2) \
+                 AND (permissions & $3) != 0",
+            )
+            .bind(user_id.get() as i64)
+            .bind(&role_ids)
+            .bind(permission.bits() as i64)
+            .bind(&guild_ids)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows.into_iter().map(|id| Id::new(id as u64)).collect())
+    }
+
+    async fn insert_permission_groups(
+        &self,
+        guild_id: &Id,
+        groups: &[PermissionGroup],
+    ) -> Result<(), DbError> {
+        if groups.is_empty() {
+            return Ok(());
+        }
+
+        let guild_id_i64 = guild_id.get() as i64;
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO permissions (guild_id, name, permissions, roles, users) ",
+        );
+        qb.push_values(groups, |mut b, group| {
+            b.push_bind(guild_id_i64)
+                .push_bind(&group.name)
+                .push_bind(group.permissions.bits() as i64)
+                .push_bind(
+                    group
+                        .roles
+                        .iter()
+                        .map(|id| id.get() as i64)
+                        .collect::<Vec<_>>(),
+                )
+                .push_bind(
+                    group
+                        .users
+                        .iter()
+                        .map(|id| id.get() as i64)
+                        .collect::<Vec<_>>(),
+                );
+        });
+        qb.build().execute(&self.pool).await?;
+
+        Ok(())
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for Config {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        let automod = row
+            .try_get::<Option<serde_json::Value>, _>("automod")?
+            .map(|v| serde_json::from_value(v))
+            .transpose()
+            .map_err(|e: serde_json::Error| sqlx::Error::Decode(e.into()))?;
+
+        Ok(Self {
+            id: Id::new(row.try_get::<i64, _>("id")? as u64),
+            prefix: row.try_get("prefix")?,
+            mute_role: row
+                .try_get::<Option<i64>, _>("mute_role")?
+                .map(|v| Id::new(v as u64)),
+            default_warn_duration: row
+                .try_get::<Option<i64>, _>("default_warn_duration")?
+                .map(|v| v as u64),
+            log_channel: row
+                .try_get::<Option<i64>, _>("log_channel")?
+                .map(|v| Id::new(v as u64)),
+            prefer_embeds: row.try_get("prefer_embeds")?,
+            inherit_discord_perms: row.try_get("inherit_discord_perms")?,
+            alert_on_infraction: row.try_get("alert_on_infraction")?,
+            send_permission_denied: row.try_get("send_permission_denied")?,
+            permission_groups: None, // populated by get_config after the groups query
+            command_aliases: row
+                .try_get::<Option<serde_json::Value>, _>("command_aliases")?
+                .and_then(|v| serde_json::from_value(v).ok()),
+            automod_enabled: row.try_get("automod_enabled")?,
+            music_enabled: row.try_get("music_enabled")?,
+            moderation_enabled: row.try_get("moderation_enabled")?,
+            automod,
         })
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct ConfigRow {
-    id: i64,
-    prefix: String,
-    mute_role: Option<i64>,
-    default_warn_duration: Option<i64>,
-    log_channel: Option<i64>,
-    prefer_embeds: bool,
-    inherit_discord_perms: bool,
-    alert_on_infraction: bool,
-    send_permission_denied: bool,
-    permission_groups: Option<serde_json::Value>,
-    automod: Option<serde_json::Value>,
-    command_aliases: Option<serde_json::Value>,
-}
-
-fn parse_json_opt<T: serde::de::DeserializeOwned>(
-    value: Option<serde_json::Value>,
-    field_name: &str,
-) -> Result<Option<T>, DbError> {
-    match value {
-        None => Ok(None),
-        Some(value) => serde_json::from_value(value)
-            .map(Some)
-            .map_err(|e| DbError::Protocol(format!("Failed to deserialize {field_name}: {e}"))),
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PermissionGroup {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            name: row.try_get("name")?,
+            permissions: PermissionSet::from_bits_retain(
+                row.try_get::<i64, _>("permissions")? as u64
+            ),
+            roles: row
+                .try_get::<Vec<i64>, _>("roles")?
+                .into_iter()
+                .map(|id| Id::new(id as u64))
+                .collect(),
+            users: row
+                .try_get::<Vec<i64>, _>("users")?
+                .into_iter()
+                .map(|id| Id::new(id as u64))
+                .collect(),
+        })
     }
 }
 
 fn to_json_opt<T: serde::Serialize>(
     value: &Option<T>,
-    field_name: &str,
 ) -> Result<Option<serde_json::Value>, DbError> {
     value
         .as_ref()
         .map(|value| {
             serde_json::to_value(value)
-                .map_err(|e| DbError::Protocol(format!("Failed to serialize {field_name}: {e}")))
+                .map_err(|e| DbError::Protocol(format!("Failed to serialize: {e}")))
         })
         .transpose()
 }

@@ -424,4 +424,62 @@ impl CacheBackend for RedisCache {
             }
         }
     }
+
+    async fn scan(&self, pattern: &str) -> Result<Vec<String>, Self::Error> {
+        let prefix_str = std::str::from_utf8(&self.prefix).unwrap_or_default();
+        let full_pattern = format!("{}{}", prefix_str, pattern);
+        let prefix_len = self.prefix.len();
+        let mut conn = self.conn.clone();
+        let mut cursor: u64 = 0;
+        let mut results = Vec::new();
+        loop {
+            let (next_cursor, batch): (u64, Vec<String>) = match redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&full_pattern)
+                .arg("COUNT")
+                .arg(100u64)
+                .query_async(&mut conn)
+                .await
+            {
+                Ok(v) => v,
+                Err(error) => {
+                    tracing::error!(error = %error, "Redis SCAN operation failed");
+                    return Err(error.into());
+                }
+            };
+            results.extend(
+                batch
+                    .into_iter()
+                    .filter_map(|k| k.get(prefix_len..).map(str::to_owned)),
+            );
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    async fn keys(&self, pattern: &str) -> Result<Vec<String>, Self::Error> {
+        let prefix_str = std::str::from_utf8(&self.prefix).unwrap_or_default();
+        let full_pattern = format!("{}{}", prefix_str, pattern);
+        let prefix_len = self.prefix.len();
+        let mut conn = self.conn.clone();
+        let raw: Vec<String> = match redis::cmd("KEYS")
+            .arg(&full_pattern)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(v) => v,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis KEYS operation failed");
+                return Err(error.into());
+            }
+        };
+        Ok(raw
+            .into_iter()
+            .filter_map(|k| k.get(prefix_len..).map(str::to_owned))
+            .collect())
+    }
 }

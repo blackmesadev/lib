@@ -127,7 +127,11 @@ impl MesastreamWsClient {
                 RECONNECT_BASE_DELAY * 2u32.saturating_pow(attempts.min(10)),
                 RECONNECT_MAX_DELAY,
             );
-            warn!(delay_ms = delay.as_millis() as u64, attempt = attempts, "mesastream ws: reconnecting");
+            warn!(
+                delay_ms = delay.as_millis() as u64,
+                attempt = attempts,
+                "mesastream ws: reconnecting"
+            );
             tokio::time::sleep(delay).await;
         }
     }

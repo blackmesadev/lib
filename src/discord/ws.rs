@@ -174,7 +174,6 @@ async fn run_tx(
     tracing::debug!("TX task exited");
 }
 
-
 // Owns the WebSocket source. Parses inbound frames, updates shared state for
 // control opcodes, and forwards dispatch events to the handle via `event_tx`.
 async fn run_rx(
@@ -303,7 +302,8 @@ async fn dispatch_raw(msg: Message, shared: &Shared) -> DiscordResult<Option<Eve
 
         OPCODE_INVALID_SESSION => {
             // `d` is a boolean: true = resumable, false = must re-IDENTIFY
-            let resumable = envelope.d
+            let resumable = envelope
+                .d
                 .as_ref()
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
@@ -577,9 +577,7 @@ impl DiscordWebsocket {
         // carry the correct seq and the INVALID_SESSION check can extract
         // the right value.
         if self.initial_seq > 0 {
-            shared
-                .sequence
-                .store(self.initial_seq, Ordering::Relaxed);
+            shared.sequence.store(self.initial_seq, Ordering::Relaxed);
         }
 
         let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(CHANNEL_CAPACITY);

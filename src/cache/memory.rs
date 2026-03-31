@@ -280,4 +280,48 @@ impl CacheBackend for MemoryCache {
     async fn ping(&self) -> Result<bool, Self::Error> {
         Ok(true)
     }
+
+    async fn scan(&self, pattern: &str) -> Result<Vec<String>, Self::Error> {
+        self.keys(pattern).await
+    }
+
+    async fn keys(&self, pattern: &str) -> Result<Vec<String>, Self::Error> {
+        Ok(self
+            .data
+            .iter()
+            .filter(|e| !Self::is_expired(e.value()) && glob_match(pattern, e.key()))
+            .map(|e| e.key().clone())
+            .collect())
+    }
+}
+
+/// Minimal glob matching supporting only `*` as a wildcard (zero or more of
+/// any character).  Sufficient for patterns like `roles:*:12345`.
+fn glob_match(pattern: &str, s: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == s;
+    }
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // first segment must be a prefix
+            if !s.starts_with(part) {
+                return false;
+            }
+            pos = part.len();
+        } else if i == parts.len() - 1 {
+            // last segment must be a suffix
+            return s[pos..].ends_with(part);
+        } else {
+            match s[pos..].find(part) {
+                Some(off) => pos += off + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
 }

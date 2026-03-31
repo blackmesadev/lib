@@ -1,10 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use super::automod::Automod;
+use crate::{discord::Id, model::permissions::PermissionGroup};
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-
-use crate::{discord::Id, permissions::PermissionSet};
-
-use super::automod::AutomodConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -26,25 +25,47 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub send_permission_denied: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_groups: Option<Vec<Group>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub automod: Option<AutomodConfig>,
+    pub permission_groups: Option<Vec<PermissionGroup>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_aliases: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub automod_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automod: Option<Automod>,
+    #[serde(default)]
+    pub music_enabled: bool,
+    #[serde(default)]
+    pub moderation_enabled: bool,
 }
 
+#[inline]
 fn default_prefix() -> String {
     "!".to_string()
 }
 
+#[inline]
 fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Group {
-    pub name: String,
-    pub roles: HashSet<Id>,
-    pub users: HashSet<Id>,
-    pub permissions: PermissionSet,
+impl Config {
+    pub fn new(id: &Id) -> Self {
+        Self {
+            id: id.clone(),
+            prefix: "!".to_string(),
+            mute_role: None,
+            default_warn_duration: None,
+            log_channel: None,
+            prefer_embeds: false,
+            inherit_discord_perms: true,
+            alert_on_infraction: true,
+            send_permission_denied: true,
+            permission_groups: None,
+            automod_enabled: false,
+            music_enabled: false,
+            moderation_enabled: false,
+            automod: None,
+            command_aliases: None,
+        }
+    }
 }

@@ -333,7 +333,10 @@ impl MesastreamClient {
     }
 
     #[instrument(skip(self), fields(player_id = %id))]
-    pub async fn get_current_track(&self, id: &Id) -> MesastreamResult<Option<CurrentTrackResponse>> {
+    pub async fn get_current_track(
+        &self,
+        id: &Id,
+    ) -> MesastreamResult<Option<CurrentTrackResponse>> {
         self.send(Method::GET, &format!("/players/{id}/current"))
             .await
     }

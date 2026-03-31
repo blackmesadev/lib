@@ -12,10 +12,7 @@ pub struct Database {
 }
 
 impl Database {
-    #[instrument(
-        name = "db_connect",
-        skip(connection_string),
-    )]
+    #[instrument(name = "db_connect", skip(connection_string))]
     pub async fn connect(connection_string: String) -> Result<Self, DbError> {
         let pool = PgPoolOptions::new()
             .min_connections(2)

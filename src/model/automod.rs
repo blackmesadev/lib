@@ -2,11 +2,13 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{discord::Id, model::InfractionType, permissions::PermissionOverride};
+use crate::{
+    discord::Id,
+    model::{permissions::PermissionOverride, InfractionType},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutomodConfig {
-    pub enabled: bool,
+pub struct Automod {
     pub global: Option<AutomodSettings>,
     #[serde(default)]
     pub channels: HashMap<Id, AutomodSettings>,

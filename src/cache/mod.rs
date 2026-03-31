@@ -63,6 +63,15 @@ pub trait CacheBackend: Send + Sync {
         K: ToRedisArgs + Send + Sync;
 
     async fn ping(&self) -> Result<bool, Self::Error>;
+
+    /// Returns all keys matching the given glob-style pattern.
+    /// Uses a cursor-based scan on Redis; iterates the in-memory map otherwise.
+    async fn scan(&self, pattern: &str) -> Result<Vec<String>, Self::Error>;
+
+    /// Returns all keys matching the given glob-style pattern using `KEYS`.
+    /// Prefer [`CacheBackend::scan`] in production; `keys` is provided for
+    /// convenience in low-traffic / test scenarios.
+    async fn keys(&self, pattern: &str) -> Result<Vec<String>, Self::Error>;
 }
 
 #[derive(Debug)]
@@ -142,5 +151,13 @@ impl<B: CacheBackend> Cache<B> {
 
     pub async fn ping(&self) -> Result<bool, B::Error> {
         self.backend.ping().await
+    }
+
+    pub async fn scan(&self, pattern: &str) -> Result<Vec<String>, B::Error> {
+        self.backend.scan(pattern).await
+    }
+
+    pub async fn keys(&self, pattern: &str) -> Result<Vec<String>, B::Error> {
+        self.backend.keys(pattern).await
     }
 }
