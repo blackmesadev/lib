@@ -1,10 +1,7 @@
 use std::{
-    borrow::Cow,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
-    time::Instant,
+    borrow::Cow, sync::{
+        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
+    }, time::Instant
 };
 
 use crate::discord::{
@@ -23,7 +20,7 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::instrument;
 
-use super::{DiscordRestClient, Guild, GuildMemberUpdate, Hello, Intents, Ready, ShardConfig};
+use super::{DiscordRestClient, Guild, GuildMemberRemove, GuildMember, Hello, Intents, Ready, ShardConfig};
 use super::{Id, VoiceServerUpdate, VoiceStateUpdate};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -51,7 +48,9 @@ const OPCODE_HEARTBEAT_ACK: u8 = 11;
 const EVENT_READY: &str = "READY";
 const EVENT_GUILD_CREATE: &str = "GUILD_CREATE";
 const EVENT_GUILD_UPDATE: &str = "GUILD_UPDATE";
+const EVENT_GUILD_MEMBER_ADD: &str = "GUILD_MEMBER_ADD";
 const EVENT_GUILD_MEMBER_UPDATE: &str = "GUILD_MEMBER_UPDATE";
+const EVENT_GUILD_MEMBER_REMOVE: &str = "GUILD_MEMBER_REMOVE";
 const EVENT_MESSAGE_CREATE: &str = "MESSAGE_CREATE";
 const EVENT_MESSAGE_UPDATE: &str = "MESSAGE_UPDATE";
 const EVENT_VOICE_STATE_UPDATE: &str = "VOICE_STATE_UPDATE";
@@ -74,7 +73,9 @@ pub enum Event {
     MessageUpdate(DiscordMessage),
     GuildCreate(Guild),
     GuildUpdate(Guild),
-    GuildMemberUpdate(GuildMemberUpdate),
+    GuildMemberAdd(GuildMember),
+    GuildMemberUpdate(GuildMember),
+    GuildMemberRemove(GuildMemberRemove),
     VoiceStateUpdate(VoiceStateUpdate),
     VoiceServerUpdate(VoiceServerUpdate),
 }
@@ -87,7 +88,9 @@ impl Event {
             Event::MessageCreate(_) => "MessageCreate",
             Event::GuildCreate(_) => "GuildCreate",
             Event::GuildUpdate(_) => "GuildUpdate",
+            Event::GuildMemberAdd(_) => "GuildMemberAdd",
             Event::GuildMemberUpdate(_) => "GuildMemberUpdate",
+            Event::GuildMemberRemove(_) => "GuildMemberRemove",
             Event::VoiceStateUpdate(_) => "VoiceStateUpdate",
             Event::VoiceServerUpdate(_) => "VoiceServerUpdate",
             Event::MessageUpdate(_) => "MessageUpdate",
@@ -255,9 +258,17 @@ async fn dispatch_raw(msg: Message, shared: &Shared) -> DiscordResult<Option<Eve
                 EVENT_GUILD_UPDATE => {
                     parse_dispatch::<Guild>(&text, EVENT_GUILD_UPDATE)?.map(Event::GuildUpdate)
                 }
+                EVENT_GUILD_MEMBER_ADD => {
+                    parse_dispatch::<GuildMember>(&text, EVENT_GUILD_MEMBER_ADD)?
+                        .map(Event::GuildMemberAdd)
+                }
                 EVENT_GUILD_MEMBER_UPDATE => {
-                    parse_dispatch::<GuildMemberUpdate>(&text, EVENT_GUILD_MEMBER_UPDATE)?
+                    parse_dispatch::<GuildMember>(&text, EVENT_GUILD_MEMBER_UPDATE)?
                         .map(Event::GuildMemberUpdate)
+                }
+                EVENT_GUILD_MEMBER_REMOVE => {
+                    parse_dispatch::<GuildMemberRemove>(&text, EVENT_GUILD_MEMBER_REMOVE)?
+                        .map(Event::GuildMemberRemove)
                 }
                 EVENT_MESSAGE_CREATE => {
                     tracing::debug!("RX: MESSAGE_CREATE");
