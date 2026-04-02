@@ -1,4 +1,4 @@
-use redis::ToRedisArgs;
+use redis::{FromRedisValue, ParsingError, ToRedisArgs};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol_str::SmolStr;
@@ -58,6 +58,13 @@ impl ToRedisArgs for Id {
         W: ?Sized + redis::RedisWrite,
     {
         self.0.write_redis_args(out);
+    }
+}
+
+impl FromRedisValue for Id {
+    fn from_redis_value(v: redis::Value) -> Result<Self, ParsingError> {
+        let id = u64::from_redis_value(v)?;
+        Ok(Self(id))
     }
 }
 
@@ -488,7 +495,7 @@ pub struct PartialGuild {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct GuildMemberUpdate {
+pub struct GuildMember {
     pub guild_id: Id,
     pub roles: HashSet<Id>,
     pub user: User,
@@ -497,6 +504,12 @@ pub struct GuildMemberUpdate {
     pub premium_since: Option<String>,
     pub deaf: bool,
     pub mute: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GuildMemberRemove {
+    pub guild_id: Id,
+    pub user: User,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

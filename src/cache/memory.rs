@@ -1,10 +1,10 @@
 use super::CacheBackend;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use redis::ToRedisArgs;
+use redis::{FromRedisValue, ToRedisArgs};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -12,6 +12,7 @@ struct CacheEntry {
     data: Vec<u8>,
     expires_at: Option<Instant>,
     zset: Option<BTreeMap<String, f64>>,
+    set: Option<HashSet<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +121,7 @@ impl CacheBackend for MemoryCache {
                 data,
                 expires_at,
                 zset: None,
+                set: None,
             },
         );
 
@@ -228,12 +230,77 @@ impl CacheBackend for MemoryCache {
             data: Vec::new(),
             expires_at: None,
             zset: Some(BTreeMap::new()),
+            set: None,
         });
 
         let zset = entry.zset.get_or_insert_with(BTreeMap::new);
         let is_new = !zset.contains_key(member);
         zset.insert(member.to_string(), score);
         Ok(is_new)
+    }
+
+    async fn sadd<K, M>(&self, key: &K, member: &M) -> Result<bool, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: ToRedisArgs + Send + Sync,
+    {
+        let key = Self::key_to_string(key);
+        let member_str = Self::key_to_string(member);
+        let mut entry = self.data.entry(key).or_insert_with(|| CacheEntry {
+            data: Vec::new(),
+            expires_at: None,
+            zset: None,
+            set: Some(HashSet::new()),
+        });
+
+        let set = entry.set.get_or_insert_with(HashSet::new);
+        Ok(set.insert(member_str))
+    }
+
+    async fn srem<K, M>(&self, key: &K, member: &M) -> Result<bool, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: ToRedisArgs + Send + Sync,
+    {
+        let key = Self::key_to_string(key);
+        let member_str = Self::key_to_string(member);
+        if let Some(mut entry) = self.data.get_mut(&key) {
+            if let Some(set) = &mut entry.set {
+                return Ok(set.remove(&member_str));
+            }
+        }
+        Ok(false)
+    }
+
+    async fn scard<K>(&self, key: &K) -> Result<u64, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+    {
+        let key = Self::key_to_string(key);
+        if let Some(entry) = self.get_entry(&key) {
+            if let Some(set) = &entry.set {
+                return Ok(set.len() as u64);
+            }
+        }
+        Ok(0)
+    }
+
+    async fn smembers<K, M>(&self, key: &K) -> Result<Vec<M>, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: DeserializeOwned + FromRedisValue,
+    {
+        let key = Self::key_to_string(key);
+        if let Some(entry) = self.get_entry(&key) {
+            if let Some(set) = &entry.set {
+                let mut result = Vec::with_capacity(set.len());
+                for member_str in set {
+                    result.push(serde_json::from_str(member_str)?);
+                }
+                return Ok(result);
+            }
+        }
+        Ok(Vec::new())
     }
 
     async fn zremrangebyscore<K>(&self, key: &K, min: f64, max: f64) -> Result<u64, Self::Error>

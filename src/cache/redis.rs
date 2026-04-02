@@ -1,6 +1,6 @@
 use super::CacheBackend;
 use async_trait::async_trait;
-use redis::{aio::MultiplexedConnection, ToRedisArgs};
+use redis::{FromRedisValue, ToRedisArgs, aio::MultiplexedConnection};
 use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 
@@ -411,6 +411,95 @@ impl CacheBackend for RedisCache {
         };
 
         Ok(set)
+    }
+
+    async fn sadd<K, M>(&self, key: &K, member: &M) -> Result<bool, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: ToRedisArgs + Send + Sync,
+    {
+        let mut conn = self.conn.clone();
+
+        let added: u64 = match redis::cmd("SADD")
+            .arg(self.pk(key))
+            .arg(member)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(added) => added,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis SADD operation failed");
+                return Err(error.into());
+            }
+        };
+
+        Ok(added > 0)
+    }
+
+    async fn srem<K, M>(&self, key: &K, member: &M) -> Result<bool, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: ToRedisArgs + Send + Sync,
+    {
+        let mut conn = self.conn.clone();
+
+        let removed: u64 = match redis::cmd("SREM")
+            .arg(self.pk(key))
+            .arg(member)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis SREM operation failed");
+                return Err(error.into());
+            }
+        };
+
+        Ok(removed > 0)
+    }
+
+    async fn scard<K>(&self, key: &K) -> Result<u64, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+    {
+        let mut conn = self.conn.clone();
+
+        let count: u64 = match redis::cmd("SCARD")
+            .arg(self.pk(key))
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis SCARD operation failed");
+                return Err(error.into());
+            }
+        };
+
+        Ok(count)
+    }
+
+    async fn smembers<K, M>(&self, key: &K) -> Result<Vec<M>, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: DeserializeOwned + FromRedisValue,
+    {
+        let mut conn = self.conn.clone();
+
+        let members: Vec<M> = match redis::cmd("SMEMBERS")
+            .arg(self.pk(key))
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(members) => members,
+            Err(error) => {
+                tracing::error!(error = %error, "Redis SMEMBERS operation failed");
+                return Err(error.into());
+            }
+        };
+
+        Ok(members)
     }
 
     async fn ping(&self) -> Result<bool, Self::Error> {

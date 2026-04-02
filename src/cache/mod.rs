@@ -1,7 +1,7 @@
 pub(crate) mod memory;
 pub(crate) mod redis;
 
-use ::redis::ToRedisArgs;
+use ::redis::{FromRedisValue, ToRedisArgs};
 use async_trait::async_trait;
 pub use memory::MemoryCache;
 pub use redis::RedisCache;
@@ -61,6 +61,25 @@ pub trait CacheBackend: Send + Sync {
     async fn expire<K>(&self, key: &K, ttl: Duration) -> Result<bool, Self::Error>
     where
         K: ToRedisArgs + Send + Sync;
+
+    async fn sadd<K, M>(&self, key: &K, member: &M) -> Result<bool, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: ToRedisArgs + Send + Sync;
+
+    async fn srem<K, M>(&self, key: &K, member: &M) -> Result<bool, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: ToRedisArgs + Send + Sync;
+
+    async fn scard<K>(&self, key: &K) -> Result<u64, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync;
+
+    async fn smembers<K, M>(&self, key: &K) -> Result<Vec<M>, Self::Error>
+    where
+        K: ToRedisArgs + Send + Sync,
+        M: DeserializeOwned + FromRedisValue;
 
     async fn ping(&self) -> Result<bool, Self::Error>;
 
@@ -147,6 +166,37 @@ impl<B: CacheBackend> Cache<B> {
         K: ToString + ToRedisArgs + Send + Sync,
     {
         self.backend.expire(key, ttl).await
+    }
+
+    pub async fn sadd<K, M>(&self, key: &K, member: &M) -> Result<bool, B::Error>
+    where
+        K: ToString + ToRedisArgs + Send + Sync,
+        M: ToRedisArgs + Send + Sync,
+    {
+        self.backend.sadd(key, member).await
+    }
+
+    pub async fn srem<K, M>(&self, key: &K, member: &M) -> Result<bool, B::Error>
+    where
+        K: ToString + ToRedisArgs + Send + Sync,
+        M: ToRedisArgs + Send + Sync,
+    {
+        self.backend.srem(key, member).await
+    }
+
+    pub async fn scard<K>(&self, key: &K) -> Result<u64, B::Error>
+    where
+        K: ToString + ToRedisArgs + Send + Sync,
+    {
+        self.backend.scard(key).await
+    }
+
+    pub async fn smembers<K, M>(&self, key: &K) -> Result<Vec<M>, B::Error>
+    where
+        K: ToString + ToRedisArgs + Send + Sync,
+        M: DeserializeOwned + FromRedisValue,
+    {
+        self.backend.smembers(key).await
     }
 
     pub async fn ping(&self) -> Result<bool, B::Error> {

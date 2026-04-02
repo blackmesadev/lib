@@ -175,7 +175,6 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(name = "db_get_expired_infractions", skip(self))]
     pub async fn get_expired_infractions(&self) -> Result<Vec<Infraction>, DbError> {
         let now = chrono::Utc::now().timestamp();
 
