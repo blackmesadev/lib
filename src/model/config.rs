@@ -36,6 +36,8 @@ pub struct Config {
     pub music_enabled: bool,
     #[serde(default)]
     pub moderation_enabled: bool,
+    #[serde(default)]
+    pub logging_enabled: bool,
 }
 
 #[inline]
@@ -64,6 +66,7 @@ impl Config {
             automod_enabled: false,
             music_enabled: false,
             moderation_enabled: false,
+            logging_enabled: false,
             automod: None,
             command_aliases: None,
         }

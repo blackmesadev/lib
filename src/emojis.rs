@@ -1,4 +1,5 @@
 pub enum Emoji {
+    None,
     Kick,
     Ban,
     Mute,
@@ -30,6 +31,7 @@ impl Emoji {
     #[inline]
     pub fn to_emoji(&self) -> &'static str {
         match self {
+            Self::None => "<:mesaMessageDelete:869663511977025586>",
             Self::Kick => "<:mesaKick:869665034312253460>",
             Self::Ban => "<:mesaBan:869663336625733634>",
             Self::Mute => "<:mesaMemberMute:869663336814497832>",

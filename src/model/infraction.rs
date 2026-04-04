@@ -158,9 +158,11 @@ impl Infraction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "infraction_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum InfractionType {
+    None,
     Warn,
     Mute,
     Kick,
@@ -177,6 +179,7 @@ impl InfractionType {
     #[inline]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            "none" => Some(Self::None),
             "warn" => Some(Self::Warn),
             "mute" => Some(Self::Mute),
             "kick" => Some(Self::Kick),
@@ -188,6 +191,7 @@ impl InfractionType {
     #[inline]
     pub fn to_str(&self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Warn => "warn",
             Self::Mute => "mute",
             Self::Kick => "kick",
@@ -198,6 +202,7 @@ impl InfractionType {
     #[inline]
     pub fn to_past_tense(&self) -> &'static str {
         match self {
+            Self::None => "None",
             Self::Warn => "Warned",
             Self::Mute => "Muted",
             Self::Kick => "Kicked",
@@ -208,6 +213,7 @@ impl InfractionType {
     #[inline]
     pub fn to_verb(&self) -> &'static str {
         match self {
+            Self::None => "None",
             Self::Warn => "Warn",
             Self::Mute => "Mute",
             Self::Kick => "Kick",
@@ -218,6 +224,7 @@ impl InfractionType {
     #[inline]
     pub fn to_noun(&self) -> &'static str {
         match self {
+            Self::None => "None",
             Self::Warn => "Warning",
             Self::Mute => "Mute",
             Self::Kick => "Kick",
@@ -228,6 +235,7 @@ impl InfractionType {
     #[inline]
     pub fn to_emoji(&self) -> &'static str {
         match self {
+            Self::None => Emoji::None.to_emoji(),
             Self::Warn => Emoji::Warn.to_emoji(),
             Self::Mute => Emoji::Mute.to_emoji(),
             Self::Kick => Emoji::Kick.to_emoji(),

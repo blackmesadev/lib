@@ -183,7 +183,7 @@ pub enum MesastreamEvent {
         player_id: Id,
         track_id: String,
     },
-    /// Voice transport disconnected — mesastream cannot send audio.
+    /// Voice transport disconnected - mesastream cannot send audio.
     /// Black Mesa should obtain fresh credentials from Discord and push
     /// them via `PUT /players/{id}/connection`.
     VoiceDisconnected {
@@ -191,7 +191,7 @@ pub enum MesastreamEvent {
         player_id: Id,
         reason: String,
     },
-    /// Server is shutting down — clients should prepare to reconnect.
+    /// Server is shutting down - clients should prepare to reconnect.
     Goodbye,
     /// Emitted locally by the WS client (not the server) when a connection
     /// is established or re-established.  Black Mesa uses this to detect

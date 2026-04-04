@@ -21,7 +21,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use tracing::instrument;
 
 use super::{DiscordRestClient, Guild, GuildMemberRemove, GuildMember, Hello, Intents, Ready, ShardConfig};
-use super::{Id, VoiceServerUpdate, VoiceStateUpdate};
+use super::{Channel, Id, VoiceServerUpdate, VoiceStateUpdate};
+use super::{GuildBanEvent, GuildRoleDeleteEvent, GuildRoleEvent, InviteCreateEvent, InviteDeleteEvent, MessageDelete};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
@@ -53,8 +54,19 @@ const EVENT_GUILD_MEMBER_UPDATE: &str = "GUILD_MEMBER_UPDATE";
 const EVENT_GUILD_MEMBER_REMOVE: &str = "GUILD_MEMBER_REMOVE";
 const EVENT_MESSAGE_CREATE: &str = "MESSAGE_CREATE";
 const EVENT_MESSAGE_UPDATE: &str = "MESSAGE_UPDATE";
+const EVENT_MESSAGE_DELETE: &str = "MESSAGE_DELETE";
 const EVENT_VOICE_STATE_UPDATE: &str = "VOICE_STATE_UPDATE";
 const EVENT_VOICE_SERVER_UPDATE: &str = "VOICE_SERVER_UPDATE";
+const EVENT_CHANNEL_CREATE: &str = "CHANNEL_CREATE";
+const EVENT_CHANNEL_UPDATE: &str = "CHANNEL_UPDATE";
+const EVENT_CHANNEL_DELETE: &str = "CHANNEL_DELETE";
+const EVENT_GUILD_ROLE_CREATE: &str = "GUILD_ROLE_CREATE";
+const EVENT_GUILD_ROLE_UPDATE: &str = "GUILD_ROLE_UPDATE";
+const EVENT_GUILD_ROLE_DELETE: &str = "GUILD_ROLE_DELETE";
+const EVENT_GUILD_BAN_ADD: &str = "GUILD_BAN_ADD";
+const EVENT_GUILD_BAN_REMOVE: &str = "GUILD_BAN_REMOVE";
+const EVENT_INVITE_CREATE: &str = "INVITE_CREATE";
+const EVENT_INVITE_DELETE: &str = "INVITE_DELETE";
 
 const INVALID_SESSION_RETRY_SECS: u64 = 5;
 const CHANNEL_CAPACITY: usize = 256;
@@ -71,6 +83,7 @@ pub enum Event {
     Ready(Ready),
     MessageCreate(DiscordMessage),
     MessageUpdate(DiscordMessage),
+    MessageDelete(MessageDelete),
     GuildCreate(Guild),
     GuildUpdate(Guild),
     GuildMemberAdd(GuildMember),
@@ -78,6 +91,16 @@ pub enum Event {
     GuildMemberRemove(GuildMemberRemove),
     VoiceStateUpdate(VoiceStateUpdate),
     VoiceServerUpdate(VoiceServerUpdate),
+    ChannelCreate(Channel),
+    ChannelUpdate(Channel),
+    ChannelDelete(Channel),
+    GuildRoleCreate(GuildRoleEvent),
+    GuildRoleUpdate(GuildRoleEvent),
+    GuildRoleDelete(GuildRoleDeleteEvent),
+    GuildBanAdd(GuildBanEvent),
+    GuildBanRemove(GuildBanEvent),
+    InviteCreate(InviteCreateEvent),
+    InviteDelete(InviteDeleteEvent),
 }
 
 impl Event {
@@ -86,6 +109,8 @@ impl Event {
         match self {
             Event::Ready(_) => "Ready",
             Event::MessageCreate(_) => "MessageCreate",
+            Event::MessageUpdate(_) => "MessageUpdate",
+            Event::MessageDelete(_) => "MessageDelete",
             Event::GuildCreate(_) => "GuildCreate",
             Event::GuildUpdate(_) => "GuildUpdate",
             Event::GuildMemberAdd(_) => "GuildMemberAdd",
@@ -93,7 +118,16 @@ impl Event {
             Event::GuildMemberRemove(_) => "GuildMemberRemove",
             Event::VoiceStateUpdate(_) => "VoiceStateUpdate",
             Event::VoiceServerUpdate(_) => "VoiceServerUpdate",
-            Event::MessageUpdate(_) => "MessageUpdate",
+            Event::ChannelCreate(_) => "ChannelCreate",
+            Event::ChannelUpdate(_) => "ChannelUpdate",
+            Event::ChannelDelete(_) => "ChannelDelete",
+            Event::GuildRoleCreate(_) => "GuildRoleCreate",
+            Event::GuildRoleUpdate(_) => "GuildRoleUpdate",
+            Event::GuildRoleDelete(_) => "GuildRoleDelete",
+            Event::GuildBanAdd(_) => "GuildBanAdd",
+            Event::GuildBanRemove(_) => "GuildBanRemove",
+            Event::InviteCreate(_) => "InviteCreate",
+            Event::InviteDelete(_) => "InviteDelete",
         }
     }
 }
@@ -206,7 +240,7 @@ async fn run_rx(
                     break;
                 }
             }
-            Ok(None) => {} // control frame — no consumer-visible event
+            Ok(None) => {} // control frame - no consumer-visible event
             Err(fatal) => {
                 let _ = event_tx.send(Err(fatal)).await;
                 break;
@@ -286,6 +320,50 @@ async fn dispatch_raw(msg: Message, shared: &Shared) -> DiscordResult<Option<Eve
                 EVENT_VOICE_SERVER_UPDATE => {
                     parse_dispatch::<VoiceServerUpdate>(&text, EVENT_VOICE_SERVER_UPDATE)?
                         .map(Event::VoiceServerUpdate)
+                }
+                EVENT_MESSAGE_DELETE => {
+                    parse_dispatch::<MessageDelete>(&text, EVENT_MESSAGE_DELETE)?
+                        .map(Event::MessageDelete)
+                }
+                EVENT_CHANNEL_CREATE => {
+                    parse_dispatch::<Channel>(&text, EVENT_CHANNEL_CREATE)?
+                        .map(Event::ChannelCreate)
+                }
+                EVENT_CHANNEL_UPDATE => {
+                    parse_dispatch::<Channel>(&text, EVENT_CHANNEL_UPDATE)?
+                        .map(Event::ChannelUpdate)
+                }
+                EVENT_CHANNEL_DELETE => {
+                    parse_dispatch::<Channel>(&text, EVENT_CHANNEL_DELETE)?
+                        .map(Event::ChannelDelete)
+                }
+                EVENT_GUILD_ROLE_CREATE => {
+                    parse_dispatch::<GuildRoleEvent>(&text, EVENT_GUILD_ROLE_CREATE)?
+                        .map(Event::GuildRoleCreate)
+                }
+                EVENT_GUILD_ROLE_UPDATE => {
+                    parse_dispatch::<GuildRoleEvent>(&text, EVENT_GUILD_ROLE_UPDATE)?
+                        .map(Event::GuildRoleUpdate)
+                }
+                EVENT_GUILD_ROLE_DELETE => {
+                    parse_dispatch::<GuildRoleDeleteEvent>(&text, EVENT_GUILD_ROLE_DELETE)?
+                        .map(Event::GuildRoleDelete)
+                }
+                EVENT_GUILD_BAN_ADD => {
+                    parse_dispatch::<GuildBanEvent>(&text, EVENT_GUILD_BAN_ADD)?
+                        .map(Event::GuildBanAdd)
+                }
+                EVENT_GUILD_BAN_REMOVE => {
+                    parse_dispatch::<GuildBanEvent>(&text, EVENT_GUILD_BAN_REMOVE)?
+                        .map(Event::GuildBanRemove)
+                }
+                EVENT_INVITE_CREATE => {
+                    parse_dispatch::<InviteCreateEvent>(&text, EVENT_INVITE_CREATE)?
+                        .map(Event::InviteCreate)
+                }
+                EVENT_INVITE_DELETE => {
+                    parse_dispatch::<InviteDeleteEvent>(&text, EVENT_INVITE_DELETE)?
+                        .map(Event::InviteDelete)
                 }
                 unknown => {
                     tracing::debug!(event = unknown, "RX: ignoring unknown event type");
@@ -416,7 +494,7 @@ pub struct DiscordWebsocket {
     /// Post-spawn: channel from the RX task.
     event_rx: Option<mpsc::Receiver<DiscordResult<Event>>>,
 
-    /// Shared atomic state — also accessible post-spawn.
+    /// Shared atomic state - also accessible post-spawn.
     shared: Option<Arc<Shared>>,
 
     /// Caller-supplied latch updated each `next_event` call.

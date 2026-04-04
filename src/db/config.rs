@@ -7,7 +7,7 @@ use crate::{
     discord::Id,
     model::{
         config::Config,
-        permissions::{PermissionGroup, PermissionSet},
+        permissions::{PermissionGroup, Permission},
     },
 };
 
@@ -88,7 +88,8 @@ impl Database {
                    automod = $11,
                    automod_enabled = $12,
                    music_enabled = $13,
-                   moderation_enabled = $14
+                   moderation_enabled = $14,
+                   logging_enabled = $15
                WHERE id = $1"#,
         )
         .bind(guild_id.get() as i64)
@@ -105,6 +106,7 @@ impl Database {
         .bind(config.automod_enabled)
         .bind(config.music_enabled)
         .bind(config.moderation_enabled)
+        .bind(config.logging_enabled)
         .execute(&self.pool)
         .await?;
 
@@ -130,9 +132,10 @@ impl Database {
                    id, prefix, mute_role, default_warn_duration, log_channel,
                    prefer_embeds, inherit_discord_perms, alert_on_infraction,
                    send_permission_denied, command_aliases, automod,
-                   automod_enabled, music_enabled, moderation_enabled
+                   automod_enabled, music_enabled, moderation_enabled,
+                   logging_enabled
                ) VALUES (
-                   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+                   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
                )"#,
         )
         .bind(config.id.get() as i64)
@@ -149,6 +152,7 @@ impl Database {
         .bind(config.automod_enabled)
         .bind(config.music_enabled)
         .bind(config.moderation_enabled)
+        .bind(config.logging_enabled)
         .execute(&self.pool)
         .await?;
 
@@ -181,7 +185,7 @@ impl Database {
         user_id: &Id,
         user_guild_ids: &[Id],
         user_role_ids: &[Id],
-        permission: PermissionSet,
+        permission: Permission,
     ) -> Result<Vec<Id>, DbError> {
         let guild_ids: Vec<i64> = user_guild_ids.iter().map(|id| id.get() as i64).collect();
         let role_ids: Vec<i64> = user_role_ids.iter().map(|id| id.get() as i64).collect();
@@ -189,7 +193,7 @@ impl Database {
         // When we know the exact guilds the user is a member of, bound the scan to
         // those guilds so Postgres avoids a full permissions-table sweep.
         let rows = if guild_ids.is_empty() {
-            // Fallback: no cached guild membership — only direct user-id matches.
+            // Fallback: no cached guild membership - only direct user-id matches.
             sqlx::query_scalar::<_, i64>(
                 "SELECT DISTINCT guild_id FROM permissions \
                  WHERE $1 = ANY(users) \
@@ -279,11 +283,12 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for Config {
             inherit_discord_perms: row.try_get("inherit_discord_perms")?,
             alert_on_infraction: row.try_get("alert_on_infraction")?,
             send_permission_denied: row.try_get("send_permission_denied")?,
-            permission_groups: None, // populated by get_config after the groups query
+            permission_groups: None,
             command_aliases: row
                 .try_get::<Option<serde_json::Value>, _>("command_aliases")?
                 .and_then(|v| serde_json::from_value(v).ok()),
             automod_enabled: row.try_get("automod_enabled")?,
+            logging_enabled: row.try_get("logging_enabled")?,
             music_enabled: row.try_get("music_enabled")?,
             moderation_enabled: row.try_get("moderation_enabled")?,
             automod,
@@ -295,7 +300,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PermissionGroup {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         Ok(Self {
             name: row.try_get("name")?,
-            permissions: PermissionSet::from_bits_retain(
+            permissions: Permission::from_bits_retain(
                 row.try_get::<i64, _>("permissions")? as u64
             ),
             roles: row

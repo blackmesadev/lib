@@ -1,5 +1,6 @@
 mod config;
 mod infractions;
+mod logging;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;

@@ -18,6 +18,8 @@ pub struct Automod {
 pub struct AutomodSettings {
     pub name: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub inherit_global: bool,
     pub censors: Option<HashMap<CensorType, Censor>>,
     pub spam: Option<SpamFilter>,
     pub bypass: Option<PermissionOverride>,

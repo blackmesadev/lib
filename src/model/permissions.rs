@@ -17,12 +17,12 @@ pub struct PermissionGroup {
     pub name: String,
     pub roles: HashSet<Id>,
     pub users: HashSet<Id>,
-    pub permissions: PermissionSet,
+    pub permissions: Permission,
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    pub struct PermissionSet: u64 {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Permission: u64 {
         // Moderation
         const MODERATION_KICK   = 1 << 0;
         const MODERATION_BAN    = 1 << 1;
@@ -88,16 +88,13 @@ bitflags! {
     }
 }
 
-/// Type alias so call sites can use `Permission::CONFIG_VIEW` etc.
-pub type Permission = PermissionSet;
-
-impl Default for PermissionSet {
+impl Default for Permission {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl PermissionSet {
+impl Permission {
     /// Parse a case-insensitive permission name (e.g. `"moderation_kick"` or `"ALL"`).
     /// Delegates to the native bitflags `from_name` after uppercasing.
     pub fn from_str(s: &str) -> Option<Self> {
@@ -110,7 +107,7 @@ impl PermissionSet {
         Self::FLAGS.iter().map(|f| *f.value()).collect()
     }
 
-    /// Raw u64 bits — for storing in the database as BIGINT.
+    /// Raw u64 bits - for storing in the database as BIGINT.
     #[inline]
     pub fn to_bits(self) -> u64 {
         self.bits()
@@ -123,19 +120,17 @@ impl PermissionSet {
     }
 
     #[inline]
-    pub fn has_permission(self, perm: PermissionSet) -> bool {
+    pub fn has_permission(self, perm: Permission) -> bool {
         self.contains(perm)
     }
 
     /// Create a PermissionSet from Discord role permissions.
-    pub fn from_discord_permissions(roles: &HashSet<Role>, present: &HashSet<Id>) -> Self {
-        let perms = roles.iter().fold(Permissions::empty(), |acc, role| {
-            if present.contains(&role.id) {
-                acc | role.permissions.clone()
-            } else {
-                acc
-            }
-        });
+    pub fn from_discord_permissions(roles: &[Role], present: &HashSet<Id>) -> Self {
+        let perms = roles
+            .iter()
+            .filter(|role| present.contains(&role.id))
+            .map(|role| role.permissions)
+            .fold(Permissions::empty(), |acc, perm| acc | perm);
 
         if perms.contains(Permissions::ADMINISTRATOR) {
             return Self::ALL;
@@ -184,9 +179,67 @@ impl PermissionSet {
     }
 }
 
-impl fmt::Display for PermissionSet {
+impl fmt::Display for Permission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         bitflags::parser::to_writer(self, f)
+    }
+}
+
+// Custom Serialize/Deserialize to support both integer and string representations
+impl Serialize for Permission {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Always serialize as u64 for compatibility with database and frontend
+        serializer.serialize_u64(self.bits())
+    }
+}
+
+impl<'de> Deserialize<'de> for Permission {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PermissionSetVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PermissionSetVisitor {
+            type Value = Permission;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a u64 integer or a string with | separated permission flags")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Permission, E>
+            where
+                E: serde::de::Error,
+            {
+                // Accept raw integer bits
+                Ok(Permission::from_bits_truncate(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Permission, E>
+            where
+                E: serde::de::Error,
+            {
+                // Accept signed integers too, convert to unsigned
+                if value < 0 {
+                    return Err(E::custom("permission bits cannot be negative"));
+                }
+                Ok(Permission::from_bits_truncate(value as u64))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Permission, E>
+            where
+                E: serde::de::Error,
+            {
+                // Accept string representation like "MODERATION_KICK | CONFIG_VIEW"
+                bitflags::parser::from_str(value)
+                    .map_err(|e| E::custom(format!("invalid permission flags: {}", e)))
+            }
+        }
+
+        deserializer.deserialize_any(PermissionSetVisitor)
     }
 }
 

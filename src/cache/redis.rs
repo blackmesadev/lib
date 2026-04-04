@@ -12,7 +12,7 @@ pub enum RedisCacheError {
     Serialization(#[from] serde_json::Error),
 }
 
-/// Lazily prefixes a key at the redis wire layer — no allocation until
+/// Lazily prefixes a key at the redis wire layer - no allocation until
 /// `write_redis_args` is called.
 struct Prefixed<'a, K: ToRedisArgs> {
     prefix: &'a [u8], // already includes the trailing ':'

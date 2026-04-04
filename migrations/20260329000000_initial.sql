@@ -1,5 +1,5 @@
 -- Types
-CREATE TYPE infraction_type AS ENUM ('warn', 'mute', 'kick', 'ban');
+CREATE TYPE infraction_type AS ENUM ('none', 'warn', 'mute', 'kick', 'ban');
 
 -- Guild configuration
 -- command_aliases: {alias: command}

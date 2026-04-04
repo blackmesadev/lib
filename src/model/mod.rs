@@ -1,12 +1,14 @@
 pub mod automod;
 pub mod config;
 pub mod infraction;
+pub mod logging;
 pub mod mesastream;
 pub mod permissions;
 
 pub use config::Config;
 pub use infraction::{Infraction, InfractionType};
-pub use permissions::{Permission, PermissionGroup, PermissionSet};
+pub use logging::LogConfig;
+pub use permissions::{Permission, PermissionGroup};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

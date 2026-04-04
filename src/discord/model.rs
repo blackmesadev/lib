@@ -379,12 +379,12 @@ pub struct EmbedField {
     pub inline: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     pub id: Id,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guild_id: Option<Id>,
-    pub name: String,
+    pub name: SmolStr,
     #[serde(rename = "type")]
     pub channel_type: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,7 +409,7 @@ pub struct Member {
     pub nick: Option<String>,
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub roles: HashSet<Id>,
-    pub joined_at: SmolStr, // ISO8601 timestamp
+    pub joined_at: String, // ISO8601 timestamp
     #[serde(skip_serializing_if = "Option::is_none")]
     pub premium_since: Option<String>,
     #[serde(default)]
@@ -453,7 +453,7 @@ pub struct User {
     pub public_flags: Option<u32>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Role {
     pub id: Id,
     pub name: SmolStr,
@@ -476,8 +476,8 @@ pub struct Guild {
     pub id: Id,
     pub name: SmolStr, // Max 100 characters
     pub icon: Option<SmolStr>,
-    #[serde(default)]
-    pub roles: HashSet<Role>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<Role>,
     pub member_count: Option<u32>, // From GUILD_CREATE gateway event
     pub approximate_member_count: Option<u32>, // From REST API with ?with_counts=true
     pub owner_id: Option<Id>,
@@ -533,6 +533,53 @@ pub struct VoiceServerUpdate {
     pub token: String,
     pub guild_id: Id,
     pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDelete {
+    pub id: Id,
+    pub channel_id: Id,
+    pub guild_id: Option<Id>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GuildRoleEvent {
+    pub guild_id: Id,
+    pub role: Role,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GuildRoleDeleteEvent {
+    pub guild_id: Id,
+    pub role_id: Id,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GuildBanEvent {
+    pub guild_id: Id,
+    pub user: User,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InviteCreateEvent {
+    pub channel_id: Id,
+    pub code: String,
+    pub guild_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inviter: Option<User>,
+    #[serde(default)]
+    pub max_age: u64,
+    #[serde(default)]
+    pub max_uses: u64,
+    #[serde(default)]
+    pub temporary: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InviteDeleteEvent {
+    pub channel_id: Id,
+    pub guild_id: Option<Id>,
+    pub code: String,
 }
 
 bitflags::bitflags! {

@@ -25,7 +25,7 @@ pub enum DiscordError {
     #[error("Gateway not connected")]
     NotConnected,
 
-    /// Discord sent op 7 (RECONNECT) — caller should try to RESUME.
+    /// Discord sent op 7 (RECONNECT) - caller should try to RESUME.
     #[error("Discord requested reconnection")]
     Reconnect,
 

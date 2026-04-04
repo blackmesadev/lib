@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 bitflags::bitflags! {
-    #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
     pub struct Permissions: u64 {
         const CREATE_INSTANT_INVITE = 1 << 0;
         const KICK_MEMBERS         = 1 << 1;

@@ -1,13 +1,3 @@
-//! WebSocket client for receiving real-time [`MesastreamEvent`]s from the
-//! mesastream service.
-//!
-//! Usage:
-//! ```ignore
-//! let (client, mut rx) = MesastreamWsClient::new("ws://localhost:8070/ws");
-//! tokio::spawn(async move { client.run().await; });
-//! while let Some(event) = rx.recv().await { /* handle event */ }
-//! ```
-
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -54,7 +44,7 @@ impl MesastreamWsClient {
 
         loop {
             if self.tx.is_closed() {
-                info!("mesastream ws: event receiver dropped — stopping");
+                info!("mesastream ws: event receiver dropped - stopping");
                 return;
             }
 
@@ -84,7 +74,7 @@ impl MesastreamWsClient {
                                         match serde_json::from_str::<MesastreamEvent>(&text) {
                                             Ok(event) => {
                                                 if matches!(&event, MesastreamEvent::Goodbye) {
-                                                    info!("mesastream ws: received Goodbye — server shutting down");
+                                                    info!("mesastream ws: received Goodbye - server shutting down");
                                                 }
                                                 if self.tx.send(event).await.is_err() {
                                                     return; // receiver dropped
@@ -106,7 +96,7 @@ impl MesastreamWsClient {
                                         warn!(error = %e, "mesastream ws: read error");
                                         break;
                                     }
-                                    _ => {} // binary, pong — ignore
+                                    _ => {} // binary, pong - ignore
                                 }
                             }
                             _ = ping_interval.tick() => {
