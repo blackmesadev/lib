@@ -7,7 +7,7 @@ pub mod permissions;
 
 pub use config::Config;
 pub use infraction::{Infraction, InfractionType};
-pub use logging::LogConfig;
+pub use logging::{LogConfig, LogEvent};
 pub use permissions::{Permission, PermissionGroup};
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,7 @@ impl UnixTimestamp {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Uuid(uuid::Uuid);
 
 impl Default for Uuid {

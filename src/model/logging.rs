@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::discord::Id;
+use crate::{discord::Id, model::Uuid};
 
 /// Top-level enum that unifies Discord gateway events and Mesa-internal events.
 /// This allows the logging system to use a single event type for lookups.
@@ -309,4 +310,367 @@ pub struct LogEventInfo {
     pub label: String,
     pub source: String,
     pub placeholders: Vec<String>,
+}
+
+/// Typed event data passed to the logging system.
+/// Each variant carries exactly the fields needed for its template placeholders,
+/// removing the need to manually build a `HashMap` at every call site.
+#[derive(Debug)]
+pub enum LogEvent {
+    // Moderation
+    ModerationKick {
+        guild_id: Id,
+        user_id: Id,
+        moderator_id: Id,
+        reason: String,
+        infraction_id: Uuid,
+    },
+    ModerationBan {
+        guild_id: Id,
+        user_id: Id,
+        moderator_id: Id,
+        reason: String,
+        duration: Option<u64>,
+        infraction_id: Uuid,
+    },
+    ModerationMute {
+        guild_id: Id,
+        user_id: Id,
+        moderator_id: Id,
+        reason: String,
+        duration: Option<u64>,
+        infraction_id: Uuid,
+    },
+    ModerationWarn {
+        guild_id: Id,
+        user_id: Id,
+        moderator_id: Id,
+        reason: String,
+        duration: Option<u64>,
+        infraction_id: Uuid,
+    },
+    ModerationUnban {
+        guild_id: Id,
+        user_id: Id,
+        moderator_id: Id,
+        reason: String,
+    },
+    ModerationUnmute {
+        guild_id: Id,
+        user_id: Id,
+        moderator_id: Id,
+        reason: String,
+    },
+    ModerationPardon {
+        guild_id: Id,
+        user_id: Id,
+        moderator_id: Id,
+        reason: String,
+        infraction_id: Uuid,
+    },
+    // -- Automod --
+    AutomodSpam {
+        guild_id: Id,
+        user_id: Id,
+        username: String,
+        channel_id: Id,
+        reason: String,
+        spam_type: String,
+        count: u64,
+        interval: u64,
+    },
+    AutomodCensor {
+        guild_id: Id,
+        user_id: Id,
+        username: String,
+        channel_id: Id,
+        reason: String,
+        filter_type: String,
+        offending_content: String,
+    },
+    // -- Discord gateway
+    GuildUpdate {
+        guild_id: Id,
+        guild_name: String,
+    },
+    GuildMemberAdd {
+        guild_id: Id,
+        user_id: Id,
+        username: String,
+    },
+    GuildMemberUpdate {
+        guild_id: Id,
+        user_id: Id,
+        username: String,
+        roles: Vec<Id>,
+    },
+    GuildMemberRemove {
+        guild_id: Id,
+        user_id: Id,
+        username: String,
+    },
+    ChannelCreate {
+        guild_id: Id,
+        channel_id: Id,
+        channel_name: String,
+    },
+    ChannelUpdate {
+        guild_id: Id,
+        channel_id: Id,
+        channel_name: String,
+    },
+    ChannelDelete {
+        guild_id: Id,
+        channel_id: Id,
+        channel_name: String,
+    },
+    MessageDelete {
+        guild_id: Id,
+        channel_id: Id,
+        message_id: Id,
+    },
+    RoleCreate {
+        guild_id: Id,
+        role_id: Id,
+        role_name: String,
+    },
+    RoleUpdate {
+        guild_id: Id,
+        role_id: Id,
+        role_name: String,
+    },
+    RoleDelete {
+        guild_id: Id,
+        role_id: Id,
+    },
+    GuildBanAdd {
+        guild_id: Id,
+        user_id: Id,
+        username: String,
+    },
+    GuildBanRemove {
+        guild_id: Id,
+        user_id: Id,
+        username: String,
+    },
+    InviteCreate {
+        guild_id: Id,
+        channel_id: Id,
+        code: String,
+        inviter_id: Option<Id>,
+    },
+    InviteDelete {
+        guild_id: Id,
+        channel_id: Id,
+        code: String,
+    },
+}
+
+impl LogEvent {
+    /// The guild this event belongs to.
+    pub fn guild_id(&self) -> &Id {
+        match self {
+            Self::ModerationKick { guild_id, .. }
+            | Self::ModerationBan { guild_id, .. }
+            | Self::ModerationMute { guild_id, .. }
+            | Self::ModerationWarn { guild_id, .. }
+            | Self::ModerationUnban { guild_id, .. }
+            | Self::ModerationUnmute { guild_id, .. }
+            | Self::ModerationPardon { guild_id, .. }
+            | Self::AutomodSpam { guild_id, .. }
+            | Self::AutomodCensor { guild_id, .. }
+            | Self::GuildUpdate { guild_id, .. }
+            | Self::GuildMemberAdd { guild_id, .. }
+            | Self::GuildMemberUpdate { guild_id, .. }
+            | Self::GuildMemberRemove { guild_id, .. }
+            | Self::ChannelCreate { guild_id, .. }
+            | Self::ChannelUpdate { guild_id, .. }
+            | Self::ChannelDelete { guild_id, .. }
+            | Self::MessageDelete { guild_id, .. }
+            | Self::RoleCreate { guild_id, .. }
+            | Self::RoleUpdate { guild_id, .. }
+            | Self::RoleDelete { guild_id, .. }
+            | Self::GuildBanAdd { guild_id, .. }
+            | Self::GuildBanRemove { guild_id, .. }
+            | Self::InviteCreate { guild_id, .. }
+            | Self::InviteDelete { guild_id, .. } => guild_id,
+        }
+    }
+
+    /// The associated `LogEventType` used for DB lookups.
+    pub fn event_type(&self) -> LogEventType {
+        match self {
+            Self::ModerationKick { .. } => LogEventType::Mesa(MesaLogEvent::ModerationKick),
+            Self::ModerationBan { .. } => LogEventType::Mesa(MesaLogEvent::ModerationBan),
+            Self::ModerationMute { .. } => LogEventType::Mesa(MesaLogEvent::ModerationMute),
+            Self::ModerationWarn { .. } => LogEventType::Mesa(MesaLogEvent::ModerationWarn),
+            Self::ModerationUnban { .. } => LogEventType::Mesa(MesaLogEvent::ModerationUnban),
+            Self::ModerationUnmute { .. } => LogEventType::Mesa(MesaLogEvent::ModerationUnmute),
+            Self::ModerationPardon { .. } => LogEventType::Mesa(MesaLogEvent::ModerationPardon),
+            Self::AutomodSpam { .. } => LogEventType::Mesa(MesaLogEvent::AutomodSpam),
+            Self::AutomodCensor { .. } => LogEventType::Mesa(MesaLogEvent::AutomodCensor),
+            Self::GuildUpdate { .. } => LogEventType::Discord(DiscordLogEvent::GuildUpdate),
+            Self::GuildMemberAdd { .. } => LogEventType::Discord(DiscordLogEvent::GuildMemberAdd),
+            Self::GuildMemberUpdate { .. } => LogEventType::Discord(DiscordLogEvent::GuildMemberUpdate),
+            Self::GuildMemberRemove { .. } => LogEventType::Discord(DiscordLogEvent::GuildMemberRemove),
+            Self::ChannelCreate { .. } => LogEventType::Discord(DiscordLogEvent::ChannelCreate),
+            Self::ChannelUpdate { .. } => LogEventType::Discord(DiscordLogEvent::ChannelUpdate),
+            Self::ChannelDelete { .. } => LogEventType::Discord(DiscordLogEvent::ChannelDelete),
+            Self::MessageDelete { .. } => LogEventType::Discord(DiscordLogEvent::MessageDelete),
+            Self::RoleCreate { .. } => LogEventType::Discord(DiscordLogEvent::RoleCreate),
+            Self::RoleUpdate { .. } => LogEventType::Discord(DiscordLogEvent::RoleUpdate),
+            Self::RoleDelete { .. } => LogEventType::Discord(DiscordLogEvent::RoleDelete),
+            Self::GuildBanAdd { .. } => LogEventType::Discord(DiscordLogEvent::GuildBanAdd),
+            Self::GuildBanRemove { .. } => LogEventType::Discord(DiscordLogEvent::GuildBanRemove),
+            Self::InviteCreate { .. } => LogEventType::Discord(DiscordLogEvent::InviteCreate),
+            Self::InviteDelete { .. } => LogEventType::Discord(DiscordLogEvent::InviteDelete),
+        }
+    }
+
+    /// Consume the event and produce the template placeholder map.
+    pub fn into_vars(self) -> HashMap<String, String> {
+        // Reduce per-entry noise: keys stay as &str literals, values call Display.
+        macro_rules! vars {
+            ($($key:literal => $val:expr),* $(,)?) => {{
+                let mut m = HashMap::new();
+                $( m.insert($key.to_owned(), $val.to_string()); )*
+                m
+            }};
+        }
+
+        match self {
+            Self::ModerationKick { guild_id, user_id, moderator_id, reason, infraction_id } => vars! {
+                "guild_id"      => guild_id,
+                "user_id"       => user_id,
+                "username"      => format!("<@{user_id}>"),
+                "moderator_id"  => moderator_id,
+                "reason"        => reason,
+                "infraction_id" => infraction_id,
+            },
+            Self::ModerationBan { guild_id, user_id, moderator_id, reason, duration, infraction_id } => vars! {
+                "guild_id"      => guild_id,
+                "user_id"       => user_id,
+                "username"      => format!("<@{user_id}>"),
+                "moderator_id"  => moderator_id,
+                "reason"        => reason,
+                "duration"      => duration.map(|d| d.to_string()).unwrap_or_else(|| "Permanent".into()),
+                "infraction_id" => infraction_id,
+            },
+            Self::ModerationMute { guild_id, user_id, moderator_id, reason, duration, infraction_id } => vars! {
+                "guild_id"      => guild_id,
+                "user_id"       => user_id,
+                "username"      => format!("<@{user_id}>"),
+                "moderator_id"  => moderator_id,
+                "reason"        => reason,
+                "duration"      => duration.map(|d| d.to_string()).unwrap_or_else(|| "Permanent".into()),
+                "infraction_id" => infraction_id,
+            },
+            Self::ModerationWarn { guild_id, user_id, moderator_id, reason, duration, infraction_id } => vars! {
+                "guild_id"      => guild_id,
+                "user_id"       => user_id,
+                "username"      => format!("<@{user_id}>"),
+                "moderator_id"  => moderator_id,
+                "reason"        => reason,
+                "duration"      => duration.map(|d| d.to_string()).unwrap_or_else(|| "Permanent".into()),
+                "infraction_id" => infraction_id,
+            },
+            Self::ModerationUnban { guild_id, user_id, moderator_id, reason } => vars! {
+                "guild_id"     => guild_id,
+                "user_id"      => user_id,
+                "username"     => format!("<@{user_id}>"),
+                "moderator_id" => moderator_id,
+                "reason"       => reason,
+            },
+            Self::ModerationUnmute { guild_id, user_id, moderator_id, reason } => vars! {
+                "guild_id"     => guild_id,
+                "user_id"      => user_id,
+                "username"     => format!("<@{user_id}>"),
+                "moderator_id" => moderator_id,
+                "reason"       => reason,
+            },
+            Self::ModerationPardon { guild_id, user_id, moderator_id, reason, infraction_id } => vars! {
+                "guild_id"      => guild_id,
+                "user_id"       => user_id,
+                "username"      => format!("<@{user_id}>"),
+                "moderator_id"  => moderator_id,
+                "reason"        => reason,
+                "infraction_id" => infraction_id,
+            },
+            Self::AutomodSpam { guild_id, user_id, username, channel_id, reason, spam_type, count, interval } => vars! {
+                "guild_id"   => guild_id,
+                "user_id"    => user_id,
+                "username"   => username,
+                "channel_id" => channel_id,
+                "reason"     => reason,
+                "spam_type"  => spam_type,
+                "count"      => count,
+                "interval"   => interval,
+            },
+            Self::AutomodCensor { guild_id, user_id, username, channel_id, reason, filter_type, offending_content } => vars! {
+                "guild_id"          => guild_id,
+                "user_id"           => user_id,
+                "username"          => username,
+                "channel_id"        => channel_id,
+                "reason"            => reason,
+                "filter_type"       => filter_type,
+                "offending_content" => offending_content,
+            },
+            Self::GuildUpdate { guild_id, guild_name } => vars! {
+                "guild_id"   => guild_id,
+                "guild_name" => guild_name,
+            },
+            Self::GuildMemberAdd { guild_id, user_id, username }
+            | Self::GuildMemberRemove { guild_id, user_id, username } => vars! {
+                "guild_id" => guild_id,
+                "user_id"  => user_id,
+                "username" => username,
+            },
+            Self::GuildMemberUpdate { guild_id, user_id, username, roles } => vars! {
+                "guild_id" => guild_id,
+                "user_id"  => user_id,
+                "username" => username,
+                "roles"    => roles.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(","),
+            },
+            Self::ChannelCreate { guild_id, channel_id, channel_name }
+            | Self::ChannelUpdate { guild_id, channel_id, channel_name }
+            | Self::ChannelDelete { guild_id, channel_id, channel_name } => vars! {
+                "guild_id"     => guild_id,
+                "channel_id"   => channel_id,
+                "channel_name" => channel_name,
+            },
+            Self::MessageDelete { guild_id, channel_id, message_id } => vars! {
+                "guild_id"   => guild_id,
+                "channel_id" => channel_id,
+                "message_id" => message_id,
+            },
+            Self::RoleCreate { guild_id, role_id, role_name }
+            | Self::RoleUpdate { guild_id, role_id, role_name } => vars! {
+                "guild_id"  => guild_id,
+                "role_id"   => role_id,
+                "role_name" => role_name,
+            },
+            Self::RoleDelete { guild_id, role_id } => vars! {
+                "guild_id"  => guild_id,
+                "role_id"   => role_id,
+                "role_name" => "",
+            },
+            Self::GuildBanAdd { guild_id, user_id, username }
+            | Self::GuildBanRemove { guild_id, user_id, username } => vars! {
+                "guild_id" => guild_id,
+                "user_id"  => user_id,
+                "username" => username,
+            },
+            Self::InviteCreate { guild_id, channel_id, code, inviter_id } => vars! {
+                "guild_id"   => guild_id,
+                "channel_id" => channel_id,
+                "code"       => code,
+                "inviter_id" => inviter_id.map(|u| u.to_string()).unwrap_or_default(),
+            },
+            Self::InviteDelete { guild_id, channel_id, code } => vars! {
+                "guild_id"   => guild_id,
+                "channel_id" => channel_id,
+                "code"       => code,
+            },
+        }
+    }
 }

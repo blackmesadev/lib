@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use redis::{FromRedisValue, ToRedisArgs};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, Vec};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -12,7 +12,7 @@ struct CacheEntry {
     data: Vec<u8>,
     expires_at: Option<Instant>,
     zset: Option<BTreeMap<String, f64>>,
-    set: Option<HashSet<String>>,
+    set: Option<Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -250,10 +250,10 @@ impl CacheBackend for MemoryCache {
             data: Vec::new(),
             expires_at: None,
             zset: None,
-            set: Some(HashSet::new()),
+            set: Some(Vec::new()),
         });
 
-        let set = entry.set.get_or_insert_with(HashSet::new);
+        let set = entry.set.get_or_insert_with(Vec::new);
         Ok(set.insert(member_str))
     }
 

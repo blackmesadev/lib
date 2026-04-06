@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use tracing::instrument;
 
 use super::{Id, Message, User, DISCORD_EPOCH};
@@ -218,12 +216,12 @@ pub struct Ctx<'a> {
     pub channel_id: &'a Id,
     pub guild_id: &'a Id,
     pub user: &'a User,
-    pub roles: &'a HashSet<Id>,
+    pub roles: &'a Vec<Id>,
     pub message: &'a Message,
 }
 
 impl<'a> Ctx<'a> {
-    pub fn new(message: &'a Message, roles: &'a HashSet<Id>) -> Option<Self> {
+    pub fn new(message: &'a Message, roles: &'a Vec<Id>) -> Option<Self> {
         Some(Self {
             channel_id: &message.channel_id,
             guild_id: message.guild_id.as_ref()?,

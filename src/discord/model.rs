@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol_str::SmolStr;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fmt;
 use std::num::ParseIntError;
 use std::str::FromStr;
@@ -407,8 +406,8 @@ pub struct Member {
     pub user: Option<User>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nick: Option<String>,
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    pub roles: HashSet<Id>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<Id>,
     pub joined_at: String, // ISO8601 timestamp
     #[serde(skip_serializing_if = "Option::is_none")]
     pub premium_since: Option<String>,
@@ -497,7 +496,8 @@ pub struct PartialGuild {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GuildMember {
     pub guild_id: Id,
-    pub roles: HashSet<Id>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<Id>,
     pub user: User,
     pub nick: Option<String>,
     pub joined_at: SmolStr,

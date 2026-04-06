@@ -1,5 +1,4 @@
 use crate::discord::{Id, Permissions, Role};
-use std::collections::HashSet;
 use std::fmt;
 
 use bitflags::{bitflags, Flags};
@@ -15,8 +14,8 @@ pub struct PermissionOverride {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionGroup {
     pub name: String,
-    pub roles: HashSet<Id>,
-    pub users: HashSet<Id>,
+    pub roles: Vec<Id>,
+    pub users: Vec<Id>,
     pub permissions: Permission,
 }
 
@@ -125,7 +124,7 @@ impl Permission {
     }
 
     /// Create a PermissionSet from Discord role permissions.
-    pub fn from_discord_permissions(roles: &[Role], present: &HashSet<Id>) -> Self {
+    pub fn from_discord_permissions(roles: &[Role], present: &Vec<Id>) -> Self {
         let perms = roles
             .iter()
             .filter(|role| present.contains(&role.id))
@@ -247,8 +246,8 @@ impl PermissionGroup {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            roles: HashSet::new(),
-            users: HashSet::new(),
+            roles: Vec::new(),
+            users: Vec::new(),
             permissions: Default::default(),
         }
     }
