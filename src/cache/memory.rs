@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use redis::{FromRedisValue, ToRedisArgs};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json;
-use std::collections::{BTreeMap, Vec};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -254,7 +254,11 @@ impl CacheBackend for MemoryCache {
         });
 
         let set = entry.set.get_or_insert_with(Vec::new);
-        Ok(set.insert(member_str))
+        if set.contains(&member_str) {
+            return Ok(false);
+        }
+        set.push(member_str);
+        Ok(true)
     }
 
     async fn srem<K, M>(&self, key: &K, member: &M) -> Result<bool, Self::Error>
@@ -266,7 +270,9 @@ impl CacheBackend for MemoryCache {
         let member_str = Self::key_to_string(member);
         if let Some(mut entry) = self.data.get_mut(&key) {
             if let Some(set) = &mut entry.set {
-                return Ok(set.remove(&member_str));
+                let before = set.len();
+                set.retain(|m| m != &member_str);
+                return Ok(set.len() < before);
             }
         }
         Ok(false)
