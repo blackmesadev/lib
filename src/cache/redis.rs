@@ -428,8 +428,39 @@ impl CacheBackend for RedisCache {
         {
             Ok(added) => added,
             Err(error) => {
-                tracing::error!(error = %error, "Redis SADD operation failed");
-                return Err(error.into());
+                // If key exists with wrong type, delete it and retry once
+                if error.to_string().contains("WRONGTYPE") {
+                    tracing::warn!(
+                        error = %error,
+                        "Redis key has wrong type for SADD, deleting and retrying"
+                    );
+
+                    if let Err(del_error) = redis::cmd("DEL")
+                        .arg(self.pk(key))
+                        .exec_async(&mut conn)
+                        .await
+                    {
+                        tracing::error!(error = %del_error, "Failed to delete malformed key");
+                        return Err(error.into());
+                    }
+
+                    // Retry SADD after deletion
+                    match redis::cmd("SADD")
+                        .arg(self.pk(key))
+                        .arg(member)
+                        .query_async(&mut conn)
+                        .await
+                    {
+                        Ok(added) => added,
+                        Err(retry_error) => {
+                            tracing::error!(error = %retry_error, "Redis SADD retry failed after key deletion");
+                            return Err(retry_error.into());
+                        }
+                    }
+                } else {
+                    tracing::error!(error = %error, "Redis SADD operation failed");
+                    return Err(error.into());
+                }
             }
         };
 
@@ -451,6 +482,23 @@ impl CacheBackend for RedisCache {
         {
             Ok(removed) => removed,
             Err(error) => {
+                // If key exists with wrong type, delete it (nothing to remove anyway)
+                if error.to_string().contains("WRONGTYPE") {
+                    tracing::warn!(
+                        error = %error,
+                        "Redis key has wrong type for SREM, deleting key"
+                    );
+
+                    if let Err(del_error) = redis::cmd("DEL")
+                        .arg(self.pk(key))
+                        .exec_async(&mut conn)
+                        .await
+                    {
+                        tracing::error!(error = %del_error, "Failed to delete malformed key");
+                    }
+                    // Return false since nothing was removed (wrong type = not a set)
+                    return Ok(false);
+                }
                 tracing::error!(error = %error, "Redis SREM operation failed");
                 return Err(error.into());
             }
@@ -472,6 +520,23 @@ impl CacheBackend for RedisCache {
         {
             Ok(count) => count,
             Err(error) => {
+                // If key exists with wrong type, delete it and return 0
+                if error.to_string().contains("WRONGTYPE") {
+                    tracing::warn!(
+                        error = %error,
+                        "Redis key has wrong type for SCARD, deleting key"
+                    );
+
+                    if let Err(del_error) = redis::cmd("DEL")
+                        .arg(self.pk(key))
+                        .exec_async(&mut conn)
+                        .await
+                    {
+                        tracing::error!(error = %del_error, "Failed to delete malformed key");
+                    }
+                    // Return 0 since wrong type = not a set = no members
+                    return Ok(0);
+                }
                 tracing::error!(error = %error, "Redis SCARD operation failed");
                 return Err(error.into());
             }
@@ -483,32 +548,35 @@ impl CacheBackend for RedisCache {
     async fn smembers<K, M>(&self, key: &K) -> Result<Vec<M>, Self::Error>
     where
         K: ToRedisArgs + Send + Sync,
-        M: DeserializeOwned + FromRedisValue,
+        M: DeserializeOwned + FromRedisValue + Send,
     {
         let mut conn = self.conn.clone();
 
-        let members: Vec<M> = match redis::cmd("SMEMBERS")
+        match redis::cmd("SMEMBERS")
             .arg(self.pk(key))
             .query_async(&mut conn)
             .await
         {
-            Ok(members) => members,
+            Ok(members) => Ok(members),
             Err(error) => {
+                // If key exists with wrong type, delete it and return empty vec
+                if error.to_string().contains("WRONGTYPE") {
+                    tracing::warn!(
+                        error = %error,
+                        "Redis key has wrong type for SMEMBERS, deleting key"
+                    );
+
+                    if let Err(del_error) = redis::cmd("DEL")
+                        .arg(self.pk(key))
+                        .exec_async(&mut conn)
+                        .await
+                    {
+                        tracing::error!(error = %del_error, "Failed to delete malformed key");
+                    }
+                    // Return empty vec since wrong type = not a set = no members
+                    return Ok(Vec::new());
+                }
                 tracing::error!(error = %error, "Redis SMEMBERS operation failed");
-                return Err(error.into());
-            }
-        };
-
-        Ok(members)
-    }
-
-    async fn ping(&self) -> Result<bool, Self::Error> {
-        let mut conn = self.conn.clone();
-
-        match redis::cmd("PING").query_async::<String>(&mut conn).await {
-            Ok(response) => Ok(response == "PONG"),
-            Err(error) => {
-                tracing::error!(error = %error, "Redis PING operation failed");
                 Err(error.into())
             }
         }
@@ -570,5 +638,16 @@ impl CacheBackend for RedisCache {
             .into_iter()
             .filter_map(|k| k.get(prefix_len..).map(str::to_owned))
             .collect())
+    }
+
+    async fn ping(&self) -> Result<bool, Self::Error> {
+        let mut conn = self.conn.clone();
+        match redis::cmd("PING").query_async::<String>(&mut conn).await {
+            Ok(response) => Ok(response == "PONG"),
+            Err(error) => {
+                tracing::error!(error = %error, "Redis PING operation failed");
+                Err(error.into())
+            }
+        }
     }
 }

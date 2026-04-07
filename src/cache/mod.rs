@@ -79,7 +79,7 @@ pub trait CacheBackend: Send + Sync {
     async fn smembers<K, M>(&self, key: &K) -> Result<Vec<M>, Self::Error>
     where
         K: ToRedisArgs + Send + Sync,
-        M: DeserializeOwned + FromRedisValue;
+        M: DeserializeOwned + FromRedisValue + Send;
 
     async fn ping(&self) -> Result<bool, Self::Error>;
 
@@ -194,7 +194,7 @@ impl<B: CacheBackend> Cache<B> {
     pub async fn smembers<K, M>(&self, key: &K) -> Result<Vec<M>, B::Error>
     where
         K: ToString + ToRedisArgs + Send + Sync,
-        M: DeserializeOwned + FromRedisValue,
+        M: DeserializeOwned + FromRedisValue + Send,
     {
         self.backend.smembers(key).await
     }
